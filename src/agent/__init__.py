@@ -1,1 +1,1 @@
-"""Gemini and LangGraph orchestration."""
+"""Azure OpenAI and LangGraph orchestration."""

@@ -34,6 +34,8 @@ class ReadOnlyPolicyTests(unittest.TestCase):
                                       args="task-manager --namespace=default"))
         enforce_read_only_policy(call("kubectl_resources", operation="get", resource="nodes",
                                       args="--namespace default"))
+        enforce_read_only_policy(call("kubectl_resources", operation="get", resource="networkpolicies",
+                                      args="--namespace default -o json"))
 
     def test_non_default_or_cluster_wide_namespace_is_rejected(self):
         for args in ("-n production", "--all-namespaces", "-A", ""):
@@ -44,6 +46,7 @@ class ReadOnlyPolicyTests(unittest.TestCase):
         forbidden = [
             ("secrets", "-n default"),
             ("serviceaccounts", "-n default"),
+            ("networkpolicies", "-n default exec"),
             ("pods", "-n default; kubectl get secrets"),
             ("pods", "-n default | cat"),
             ("pods", "-n default $(whoami)"),

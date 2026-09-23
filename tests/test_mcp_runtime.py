@@ -1,8 +1,10 @@
 import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import patch
+from dataclasses import replace
 
 from src.mcp.runtime import MCPRuntime, MCPRuntimeError, mcp_connections
+from src.config import Settings, load_settings
 
 
 class Tool:
@@ -93,3 +95,39 @@ class MCPRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict("os.environ", {"AKS_MCP_PATH": "/opt/aks-mcp"}, clear=True):
             self.assertEqual(mcp_connections()["aks"]["command"], "/opt/aks-mcp")
+
+    def test_configured_azure_directory_is_the_only_added_environment_value(self):
+        settings = Settings("https://example.test", "test-key", "/opt/aks-mcp")
+        baseline = mcp_connections(settings)
+        configured = replace(settings, azure_config_dir="/tmp/isolated azure config")
+        with patch.dict("os.environ", {"AZURE_CONFIG_DIR": "/tmp/not-the-settings-value",
+                                       "UNRELATED_SECRET": "not-forwarded", "AZURE_OPENAI_API_KEY": "not-forwarded"}):
+            connections = mcp_connections(configured)
+        self.assertEqual(connections["azure-devops"]["env"], {"AZURE_CONFIG_DIR": configured.azure_config_dir})
+        self.assertEqual(connections["aks"]["env"], {"USE_LEGACY_TOOLS": "true", "AZURE_CONFIG_DIR": configured.azure_config_dir})
+        # All original server commands, arguments, transports and settings stay identical.
+        del connections["azure-devops"]["env"]
+        del connections["aks"]["env"]["AZURE_CONFIG_DIR"]
+        self.assertEqual(connections, baseline)
+        self.assertNotIn("env", baseline["azure-devops"])
+        self.assertEqual(baseline["aks"]["env"], {"USE_LEGACY_TOOLS": "true"})
+
+    def test_unconfigured_settings_do_not_inherit_directory_from_parent(self):
+        for directory in (None, ""):
+            with self.subTest(directory=directory), patch.dict("os.environ", {"AZURE_CONFIG_DIR": "/tmp/parent"}):
+                connections = mcp_connections(Settings("https://example.test", "test-key", "/opt/aks-mcp", azure_config_dir=directory))
+            self.assertNotIn("env", connections["azure-devops"])
+            self.assertEqual(connections["aks"]["env"], {"USE_LEGACY_TOOLS": "true"})
+
+    async def test_runtime_passes_configured_directory_to_client_and_preserves_lifecycle(self):
+        settings = load_settings({"AZURE_OPENAI_ENDPOINT": "https://example.test", "AZURE_OPENAI_API_KEY": "test-key",
+                                  "AKS_MCP_PATH": "/opt/aks-mcp", "AZURE_CONFIG_DIR": "/tmp/ci-azure"})
+        with patch("src.mcp.runtime.MultiServerMCPClient", return_value=self.client) as factory:
+            runtime = MCPRuntime(settings=settings, tool_loader=self.runtime.tool_loader, log=lambda _: None)
+        factory.assert_called_once_with(mcp_connections(settings), handle_tool_errors=False)
+        for connection in factory.call_args.args[0].values():
+            self.assertEqual(connection["env"]["AZURE_CONFIG_DIR"], "/tmp/ci-azure")
+        await runtime.initialize()
+        await runtime.close()
+        self.assertEqual(self.client.opens, ["azure-devops", "aks"])
+        self.assertEqual(self.client.closes, ["aks", "azure-devops"])

@@ -6,8 +6,10 @@ import re
 from langchain_core.messages import AIMessage, ToolMessage
 
 
+MAX_REVIEW_EXCERPT_CHARS = 1000
+
 REVIEW_FORMAT = """
-For every infrastructure review, return ONLY a JSON object with a nonempty
+For every infrastructure review, return ONLY a JSON object with a zero-to-three-item
 "findings" array. Each finding must have these string keys:
 "Finding", "Evidence", "File", "Why it matters", "Verification needed", "Confidence".
 Evidence must be one short, exact, contiguous Terraform excerpt copied from a
@@ -63,8 +65,8 @@ def validate_review(content, files):
         payload = json.loads(content)
     except json.JSONDecodeError as error:
         return [], [f'Review rejected: invalid JSON at line {error.lineno}, column {error.colno}: {error.msg}.']
-    except (TypeError, ValueError) as error:
-        return [], [f'Review rejected: invalid JSON input: {error}.']
+    except (TypeError, ValueError):
+        return [], ['Review rejected: invalid JSON input.']
     if not isinstance(payload, dict):
         return [], ['Review rejected: expected a JSON object containing a findings array.']
     if 'findings' not in payload:
@@ -72,8 +74,6 @@ def validate_review(content, files):
     findings = payload['findings']
     if not isinstance(findings, list):
         return [], ['Review rejected: findings must be an array.']
-    if not findings:
-        return [], ['Review rejected: wrong number of findings: got 0; expected at least 1.']
     accepted, rejected = [], []
     fields = ('Finding', 'Evidence', 'File', 'Why it matters', 'Verification needed', 'Confidence')
     for index, finding in enumerate(findings, 1):
@@ -97,7 +97,7 @@ def validate_review(content, files):
         if path not in files:
             rejected.append(f'Finding {index} rejected: referenced file was not read this turn: {path}.')
             continue
-        if len(evidence) > 1000:
+        if len(evidence) > MAX_REVIEW_EXCERPT_CHARS:
             rejected.append(f'Finding {index} rejected: evidence excerpt exceeds 1000 characters (got {len(evidence)}).')
             continue
         if evidence not in files[path]:

@@ -28,9 +28,10 @@ class ReviewSchemaTests(unittest.TestCase):
         self.assertIsInstance(self.response, ReviewResponse)
         self.assertEqual(len(self.response.findings), 3)
 
-    def test_two_findings_are_rejected(self):
-        with self.assertRaises(ValidationError):
-            ReviewResponse(findings=self.findings[:2])
+    def test_zero_to_three_findings_are_accepted(self):
+        for count in range(4):
+            response = ReviewResponse(findings=self.findings[:count])
+            self.assertEqual(len(response.findings), count)
 
     def test_four_findings_are_rejected(self):
         with self.assertRaises(ValidationError):
@@ -44,6 +45,7 @@ class ReviewSchemaTests(unittest.TestCase):
                 "Finding",
                 "File",
                 "Evidence line",
+                "Evidence end line",
                 "Why it matters",
                 "Verification needed",
                 "Confidence",
@@ -111,6 +113,31 @@ class ReviewSchemaTests(unittest.TestCase):
             json.loads(content)["findings"][0]["Evidence"],
             '    name = "exact"  ',
         )
+
+    def test_multiline_exact_crlf_evidence(self):
+        source = 'terraform {\r\n  required_version = ">= 1.5.0"\r\n}\r\n'
+        finding = self.findings[0].model_copy(update={"evidence_line": 1, "evidence_end_line": 3})
+        files = {finding.File: source}
+        content = review_response_content(ReviewResponse(findings=[finding]), files)
+        self.assertEqual(json.loads(content)["findings"][0]["Evidence"], source[:-2])
+        self.assertFalse(validate_review(content, files)[1])
+
+    def test_invalid_and_oversized_ranges(self):
+        for start, end, source in ((2, 1, 'a\nb'), (1, 3, 'a\nb'),
+                                   (1, 21, 'a\n' * 21), (1, 1, 'a' * 1001)):
+            with self.subTest(start=start, end=end):
+                finding = self.findings[0].model_copy(update={"evidence_line": start, "evidence_end_line": end})
+                with self.assertRaises(ValueError):
+                    review_response_content(ReviewResponse(findings=[finding]), {finding.File: source})
+
+    def test_line_numbers_are_strict_integers(self):
+        for value in (True, "1", 0, -1, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                ReviewFinding.model_validate({**self.findings[0].model_dump(by_alias=True), "Evidence end line": value})
+
+    def test_azure_schema_requires_nullable_end_line(self):
+        schema = ReviewResponse.model_json_schema()["$defs"]["ReviewFinding"]
+        self.assertIn("Evidence end line", schema["required"])
 
 
 if __name__ == "__main__":

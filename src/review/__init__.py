@@ -1,1 +1,1 @@
-"""Terraform evidence collection and structured Gemini review support."""
+"""Terraform evidence collection and structured review support."""

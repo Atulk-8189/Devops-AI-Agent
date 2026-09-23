@@ -24,7 +24,6 @@ class ReviewValidationTests(unittest.TestCase):
             ('{}', 'missing findings array'),
             ('[]', 'expected a JSON object'),
             ('{"findings": {}}', 'findings must be an array'),
-            ('{"findings": []}', 'got 0; expected at least 1'),
             ('{"findings": [null]}', 'expected an object'),
         ]:
             with self.subTest(payload=payload):
@@ -38,6 +37,9 @@ class ReviewValidationTests(unittest.TestCase):
                 self.reject(json.dumps({'findings': [finding]}), 'missing required field(s): ' + key)
                 finding[key] = ' '
                 self.reject(json.dumps({'findings': [finding]}), 'must be nonempty strings: ' + key)
+
+    def test_zero_findings_are_valid(self):
+        self.assertEqual(validate_review('{"findings": []}', self.files), ([], []))
 
     def test_evidence_failures(self):
         for changes, expected in [

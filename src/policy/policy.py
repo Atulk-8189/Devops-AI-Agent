@@ -1,9 +1,10 @@
 """Shared read-only policy, normalization, and graph state."""
 import re
 import shlex
-from typing import Annotated, TypedDict
-from langchain_core.messages import AnyMessage
-from langgraph.graph import add_messages
+import logging
+from src.observability import observed_policy
+
+LOGGER = logging.getLogger(__name__)
 
 
 READ_ONLY_POLICY = {
@@ -30,7 +31,7 @@ ALLOWED_NAMESPACE = "default"
 
 KUBERNETES_RESOURCES = frozenset({
     "pods", "deployments", "replicasets", "services", "endpoints", "endpointslices",
-    "events", "configmaps", "jobs", "cronjobs", "nodes", "horizontalpodautoscalers",
+    "events", "networkpolicies", "configmaps", "jobs", "cronjobs", "nodes", "horizontalpodautoscalers",
     "persistentvolumeclaims",
 })
 SHELL_METACHARACTERS = frozenset({";", "|", "&", "<", ">", "`", "$", "(", ")", "\\", "\n", "\r"})
@@ -103,6 +104,7 @@ def _validate_aks_arguments(args):
         raise PermissionError("Tool call blocked by read-only policy")
 
 
+@observed_policy
 def enforce_read_only_policy(call):
     name = call["name"]
     args = call["args"]
@@ -128,7 +130,7 @@ def enforce_read_only_policy(call):
         raise PermissionError("Tool call blocked by read-only policy")
     if "project" not in args:
         call["args"]["project"] = ALLOWED_PROJECT
-        print(f"Policy normalization: injected project='{ALLOWED_PROJECT}'", flush=True)
+        LOGGER.info("policy normalization: injected authorized project")
     elif args["project"] != ALLOWED_PROJECT:
         raise PermissionError("Tool call blocked by read-only policy")
     if name == "repo_file":
@@ -138,8 +140,4 @@ def enforce_read_only_policy(call):
         ):
             call["args"]["version"] = ALLOWED_BRANCH
             call["args"]["versionType"] = "Branch"
-            print(f"Policy normalization: using branch='{ALLOWED_BRANCH}'", flush=True)
-
-
-class State(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
+            LOGGER.info("policy normalization: applied authorized branch")
