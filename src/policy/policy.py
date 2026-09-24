@@ -7,6 +7,14 @@ from src.observability import observed_policy
 LOGGER = logging.getLogger(__name__)
 
 
+class PipelinePolicyError(PermissionError):
+    """Preserve the public policy error while attaching an application-owned reason."""
+
+    def __init__(self, diagnostic_reason):
+        super().__init__("Tool call blocked by read-only policy")
+        self.diagnostic_reason = diagnostic_reason
+
+
 READ_ONLY_POLICY = {
     "pipelines_definition": {"list"},
     "repo_repository": {"list"},
@@ -127,11 +135,15 @@ def enforce_read_only_policy(call):
 
     allowed_actions = READ_ONLY_POLICY[name]
     if args.get("action") not in allowed_actions:
+        if name == "pipelines_definition":
+            raise PipelinePolicyError("action_not_allowed")
         raise PermissionError("Tool call blocked by read-only policy")
     if "project" not in args:
         call["args"]["project"] = ALLOWED_PROJECT
         LOGGER.info("policy normalization: injected authorized project")
     elif args["project"] != ALLOWED_PROJECT:
+        if name == "pipelines_definition":
+            raise PipelinePolicyError("project_mismatch")
         raise PermissionError("Tool call blocked by read-only policy")
     if name == "repo_file":
         if (

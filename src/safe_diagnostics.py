@@ -7,6 +7,51 @@ from dataclasses import dataclass
 CATEGORIES = frozenset({"validation", "policy", "authentication", "authorization", "configuration",
                         "mcp", "timeout", "model", "tool", "unexpected"})
 
+API_METADATA_FIELDS = frozenset({"http_status", "api_error_type", "api_error_code", "api_error_param"})
+# Never accept arbitrary server text merely because it resembles an identifier.
+_API_ERROR_LABELS = frozenset({
+    "invalid_request_error", "authentication_error", "permission_error", "rate_limit_error",
+    "server_error", "invalid_request", "invalid_value", "invalid_parameter", "invalid_type",
+    "missing_required_parameter", "unsupported_parameter", "unsupported_value",
+    "content_filter", "ResponsibleAIPolicyViolation", "context_length_exceeded",
+    "rate_limit_exceeded", "insufficient_quota", "access_denied", "DeploymentNotFound",
+    "OperationNotSupported", "BadRequest", "Unauthorized", "Forbidden",
+})
+_API_PARAM = re.compile(
+    r"(?:model|messages|tools|tool_choice|response_format|max_tokens|max_completion_tokens|temperature|top_p)"
+    r"(?:(?:\[[0-9]{1,6}\]|\.[0-9]{1,6})|\.(?:role|content|tool_calls|tool_call_id|id|type|text|"
+    r"function|name|arguments|parameters|json_schema|schema|strict))*"
+)
+
+
+def _safe_api_field(key, value):
+    if key == "http_status":
+        return type(value) is int and 400 <= value <= 599
+    if type(value) is not str or len(value) > 128 or sensitive(value):
+        return False
+    if key == "api_error_param":
+        return _API_PARAM.fullmatch(value) is not None
+    return value in _API_ERROR_LABELS
+
+
+def safe_model_error_metadata(error):
+    """Read only selected structured SDK fields; never serialize bodies/messages/headers."""
+    from openai import APIError
+
+    if not isinstance(error, APIError):
+        return {}
+    try:
+        body = error.body if type(error.body) is dict else {}
+        if type(body.get("error")) is dict:
+            body = body["error"]
+        values = {"http_status": getattr(error, "status_code", None)}
+        for name in ("type", "code", "param"):
+            values["api_error_" + name] = body.get(name, getattr(error, name, None))
+        return safe_fields(**values)
+    except Exception:
+        # Diagnostics must never replace the original API failure.
+        return {}
+
 
 def sensitive(value):
     if not isinstance(value, str):
@@ -62,14 +107,17 @@ def classify_error(error, *, boundary=None):
 def safe_fields(**fields):
     """Reject unknown fields; omit non-scalar or unsafe values. No payload fields."""
     allowed = {"event", "request_id", "task_id", "route", "tool_name", "operation", "outcome",
-               "error_category", "reason_code", "duration"}
+               "error_category", "reason_code", "duration"} | API_METADATA_FIELDS
     if set(fields) - allowed:
         raise ValueError("Unsupported diagnostic field")
     result = {}
     for key, value in fields.items():
-        if key == "error_category" and isinstance(value, str) and value in CATEGORIES:
+        if key in API_METADATA_FIELDS:
+            if _safe_api_field(key, value):
+                result[key] = value
+        elif key == "error_category" and isinstance(value, str) and value in CATEGORIES:
             result[key] = value
-        elif key == "reason_code" and isinstance(value, str) and value in {category + "_failed" for category in CATEGORIES} | {"mcp_unavailable", "operation_timeout", "policy_blocked"}:
+        elif key == "reason_code" and isinstance(value, str) and value in {category + "_failed" for category in CATEGORIES} | {"mcp_unavailable", "operation_timeout", "policy_blocked", "action_not_allowed", "project_mismatch"}:
             result[key] = value
         elif key == "duration":
             if type(value) in (int, float) and 0 <= value < 1e9:

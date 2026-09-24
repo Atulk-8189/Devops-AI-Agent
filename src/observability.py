@@ -8,8 +8,9 @@ from functools import wraps
 from time import monotonic
 from uuid import uuid4
 
-from src.safe_diagnostics import classify_error, safe_fields
+from src.safe_diagnostics import classify_error, safe_fields, safe_model_error_metadata, API_METADATA_FIELDS
 from src.metrics import METRICS
+from src.model_request_diagnostics import request_structure
 from src.request_budget import (RequestBudget, RequestBoundExceeded, BoundedResult,
     current_budget, checkpoint, charge_input, accept_result,
     MAX_REQUEST_MODEL_CALLS, MAX_REQUEST_TOOL_ATTEMPTS)
@@ -22,8 +23,8 @@ _FIELDS = {
     "mcp_server", "tool_name", "operation", "purpose_code", "policy_decision",
     "reason_code", "outcome", "duration_ms", "attempt_count", "dispatch_count",
     "remaining_budget", "evidence_status", "truncated", "error_category",
-    "budget_type", "limit", "current_usage",
-}
+    "budget_type", "limit", "current_usage", "model_call_sequence_number",
+} | API_METADATA_FIELDS
 
 
 def event_record(event, **fields):
@@ -34,10 +35,12 @@ def event_record(event, **fields):
     for key, value in {"event": event, **fields}.items():
         if value is None:
             continue
-        if key == "truncated":
+        if key in API_METADATA_FIELDS:
+            result.update(safe_fields(**{key: value}))
+        elif key == "truncated":
             if type(value) is bool:
                 result[key] = value
-        elif key in {"duration_ms", "attempt_count", "dispatch_count", "remaining_budget", "limit", "current_usage"}:
+        elif key in {"duration_ms", "attempt_count", "dispatch_count", "remaining_budget", "limit", "current_usage", "model_call_sequence_number"}:
             safe = safe_fields(duration=value)
             if safe:
                 result[key] = safe["duration"]
@@ -153,8 +156,13 @@ def observed_policy(function):
             result = function(call)
         except Exception as error:
             safe = classify_error(error)
+            reason = safe.reason_code
+            detail = getattr(error, "diagnostic_reason", None)
+            if (safe.category == "policy" and call.get("name") == "pipelines_definition"
+                    and type(detail) is str and detail in {"action_not_allowed", "project_mismatch"}):
+                reason = detail
             emit("policy_decision", policy_decision="reject", outcome="rejected",
-                 error_category=safe.category, reason_code=safe.reason_code, **metadata)
+                 error_category=safe.category, reason_code=reason, **metadata)
             raise
         emit("policy_decision", policy_decision="allow", outcome="allowed", **metadata)
         return result
@@ -171,7 +179,22 @@ async def model_call(client, **kwargs):
     except RequestBoundExceeded as error:
         emit("model_call_stopped", outcome="bounded", reason_code="deadline_exceeded" if error.kind == "deadline" else "aggregate_limit")
         raise
-    return await _call("model", lambda: client.chat.completions.create(**kwargs))
+    state = _request.get()
+    sequence = None
+    if state is not None:
+        sequence = state.get("model_calls", 0) + 1
+        state["model_calls"] = sequence
+        try:
+            record = event_record("model_request_structure", request_id=state["request_id"],
+                                  task_id=state["task_id"], route=_route.get(),
+                                  model_call_sequence_number=sequence)
+            # Only this closed, content-free projector may add nested metadata.
+            record.update(request_structure(kwargs.get("messages"), kwargs.get("tools")))
+            LOGGER.info(json.dumps(record, sort_keys=True))
+        except Exception:
+            pass  # Diagnostics must never alter model execution or its errors.
+    return await _call("model", lambda: client.chat.completions.create(**kwargs),
+                       model_call_sequence_number=sequence)
 
 
 async def evidence_call(invoke):
@@ -209,7 +232,8 @@ async def _call(boundary, invoke, **metadata):
         safe = classify_error(error, boundary=boundary)
         emit("mcp_failure" if boundary == "mcp" else "model_call_failed", outcome="failed",
              duration_ms=(monotonic()-started)*1000, error_category=safe.category,
-             reason_code=safe.reason_code, **metadata)
+             reason_code=safe.reason_code, **metadata,
+             **(safe_model_error_metadata(error) if boundary == "model" else {}))
         raise
     messages = result.get("messages", []) if isinstance(result, dict) else [result]
     failed = any(getattr(message, "status", None) == "error" for message in messages)

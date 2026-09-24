@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 from contextlib import contextmanager
 import json
 from types import SimpleNamespace
@@ -198,7 +199,10 @@ class PipelineReadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.close_calls, 1)
         advertised = client.create.await_args_list[0].kwargs["tools"]
         self.assertEqual(len(advertised), 1)
-        self.assertEqual(advertised[0]["function"]["parameters"], PIPELINE_DEFINITION_SCHEMA)
+        expected_schema = deepcopy(PIPELINE_DEFINITION_SCHEMA)
+        expected_schema["properties"]["action"]["enum"] = ["list"]
+        self.assertEqual(advertised[0]["function"]["parameters"], expected_schema)
+        self.assertEqual(pipeline_tool.args_schema, PIPELINE_DEFINITION_SCHEMA)
         feedback = client.create.await_args_list[1].kwargs["messages"][-1]
         self.assertEqual(feedback["role"], "tool")
         self.assertEqual(feedback["tool_call_id"], "pipeline-call-1")

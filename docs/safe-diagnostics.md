@@ -35,3 +35,59 @@ filtered; callers can still expose raw exceptions by explicitly printing uncaugh
 library errors. Full source, authentication objects and failed input bodies must
 not be logged. Endpoint restrictions, dependency pinning, external metrics and tracing
 are separate work, not implemented here.
+
+## Safe model API error metadata
+
+`model_call_failed` additionally supports `http_status` (integer 400–599),
+`api_error_type`, `api_error_code`, and `api_error_param`. Only OpenAI SDK API
+exceptions are inspected, using already-parsed structured fields (including an
+Azure `error` wrapper). No response body is serialized or parsed from exception
+text. Headers, request IDs from the server, messages, inner errors, prompts and
+repository content are not copied.
+
+Types/codes must match a small fixed vocabulary in `safe_diagnostics.py`;
+parameters must match bounded known API field paths, such as
+`messages[9].tool_call_id`. Existing sensitive-value checks also apply. Unknown,
+sensitive, malformed or missing values are omitted, not echoed or stringified.
+This intentionally may omit new provider codes. Event serialization revalidates
+these fields. They are not new metric labels. Public CLI wording, exception
+propagation, and authentication/authorization classification remain unchanged.
+
+## Temporary outgoing-request structural diagnostic
+
+Before each model invocation within an observed request, `model_request_structure`
+records a content-free projection of the outgoing messages. Its request ID and
+`model_call_sequence_number` correlate with model started/completed/failed events.
+The sequence resets for every request. This instrumentation does not change or
+reject requests, repair pairing, or enable a verbose payload/debug mode.
+
+The projection includes message count/order, fixed role/type labels, text character
+counts, null/string/list content classification, tool-call counts, allowlisted tool
+names, ID-presence/matching booleans, result counts, and overall pairing/structure
+validity. No actual tool-call IDs or hashes are emitted. It never emits prompts,
+arguments, schemas/descriptions, repository identifiers/paths, source, credentials,
+raw responses, or raw request JSON. Serialized message length is computed locally
+and only its integer length is retained; it is not an exact HTTP wire-byte count.
+
+This is a structural check of the application's text/function-call format, not a
+complete provider schema validator or a claim that Azure will accept the request.
+Snapshots are capped at 128 messages; `snapshot_complete=false` flags a capped or
+unavailable list, and totals then cover inspected messages only. Diagnostic
+failures cannot stop model execution. No additional persistence or metric labels
+are introduced. Remove this temporary instrumentation after diagnosing the HTTP
+400. A successful-versus-failed live comparison still requires an independently
+authorized live run; offline tests do not establish the cause of the real failure.
+
+## Fixed issue: orphan validation ToolMessage
+
+In `workflows.py`, the generic agent's unknown-tool, schema-validation and
+repository-discovery rejection branches previously returned `validation_error`
+without adding the assistant message containing the rejected tool call. The
+error node then appended an orphan ToolMessage. These branches now retain the
+assistant call before the error node appends its matching result. Offline graph
+regressions check pairing at each model request, including recovery and stops.
+
+The observed live failure had only two MCP dispatches and a 128-character error
+tool message: the repository-discovery prerequisite rejection, not a dispatched
+file read. Policy rejection remains a hard failure and sends no subsequent model
+request; this fix does not turn security failures into recoverable tool feedback.

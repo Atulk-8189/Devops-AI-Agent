@@ -2,6 +2,7 @@
 
 import json
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from src.safe_diagnostics import classify_error, diagnostic_line, error_content_text
 from src.observability import model_call, mcp_call, emit, evidence_call
@@ -82,10 +83,35 @@ def openai_tools(tools):
     result = []
     for tool in tools:
         schema = tool.args_schema
+        parameters = schema if isinstance(schema, dict) else schema.model_json_schema()
+        if tool.name == "pipelines_definition":
+            # Narrow model choices without changing the MCP schema or execution policy.
+            parameters = deepcopy(parameters)
+            parameters.setdefault("properties", {}).setdefault("action", {"type": "string"})["enum"] = ["list"]
+            required = parameters.setdefault("required", [])
+            if "action" not in required:
+                required.append("action")
+        elif tool.name in {"repo_file", "repo_repository"}:
+            # Describe the local prerequisite without altering MCP validation or behavior.
+            parameters = deepcopy(parameters)
+            properties = parameters.get("properties", {})
+            if tool.name == "repo_file" and "repositoryId" in properties:
+                properties["repositoryId"]["description"] = (
+                    "The exact repository ID returned by successful, complete, unambiguous repository discovery. "
+                    "Do not provide the repository name. Complete repo_repository/list discovery before file access; "
+                    "do not infer IDs from pipeline metadata."
+                )
+            elif tool.name == "repo_repository" and "repoNameFilter" in properties:
+                properties["repoNameFilter"]["description"] = (
+                    "Optional repository-name filter. MCP supports case-insensitive substring filtering, "
+                    "but local verified selection requires the exact, case-sensitive repository name. "
+                    "When selecting a repository for file access, provide its exact name and complete discovery "
+                    "before using the returned repository ID."
+                )
         result.append({"type": "function", "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": schema if isinstance(schema, dict) else schema.model_json_schema(),
+            "parameters": parameters,
         }})
     return result
 
@@ -396,7 +422,7 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
             executed_tool_calls += 1
             tool = tools_by_name.get(call["name"])
             if tool is None:
-                return {"validation_error": {
+                return {"messages": [AIMessage(content=message.content or "", tool_calls=tool_calls)], "validation_error": {
                     "tool_call_id": call["id"],
                     "tool_name": call["name"],
                     "content": validation_error_message(call["name"]),
@@ -405,13 +431,13 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
                 validate_tool_arguments(tool, call["args"])
             except ToolArgumentValidationError:
                 emit("schema_validation_failed", outcome="rejected", error_category="validation", reason_code="validation_failed")
-                return {"validation_error": {
+                return {"messages": [AIMessage(content=message.content or "", tool_calls=tool_calls)], "validation_error": {
                     "tool_call_id": call["id"],
                     "tool_name": call["name"],
                     "content": validation_error_message(call["name"]),
                 }}
             if call["name"] == "repo_file" and call["args"].get("repositoryId") not in repository_discovery.allowed_ids:
-                return {"validation_error": {
+                return {"messages": [AIMessage(content=message.content or "", tool_calls=tool_calls)], "validation_error": {
                     "tool_call_id": call["id"], "tool_name": call["name"],
                     "content": "Repository discovery required: use an ID from a complete, unambiguous repo_repository/list result. Do not invent repository IDs.",
                 }}
