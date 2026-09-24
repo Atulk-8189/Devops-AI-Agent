@@ -710,9 +710,17 @@ async def _collect_task_manager_evidence(tools, evidence, log) -> Troubleshootin
 
 def is_task_manager_troubleshooting_question(question: str) -> bool:
     normalized = question.lower().replace("-", " ")
-    return "task manager" in normalized and any(phrase in normalized for phrase in (
+    if "task manager" not in normalized:
+        return False
+    existing_intent = any(phrase in normalized for phrase in (
         "not working", "why", "troubleshoot", "troubleshooting", "diagnose", "diagnosis",
     ))
+    # Health checks must name both this workload and a Kubernetes context.
+    health_check = (
+        re.search(r"\b(?:aks|cluster|kubernetes|deployments?|pods?)\b", normalized)
+        and re.search(r"\b(?:check|inspect|health|healthy|unhealthy|readiness|status)\b", normalized)
+    )
+    return existing_intent or bool(health_check)
 
 
 def _redact_text(value: Any, limit=500) -> str:

@@ -16,6 +16,22 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
     def test_hyphenated_task_manager_question_routes_to_aks(self):
         self.assertEqual(route_question("Please troubleshoot task-manager"), "aks")
 
+    def test_live_task_manager_health_request_routes_to_aks(self):
+        self.assertEqual(route_question(
+            "Check the Task Manager application in the AKS cluster and tell me whether "
+            "the deployment and pods are healthy. If there are problems, explain the observed evidence."
+        ), "aks")
+
+    def test_task_manager_pod_health_routes_to_aks(self):
+        self.assertEqual(route_question("Are the Task Manager pods healthy?"), "aks")
+
+    def test_health_detection_stays_workload_and_kubernetes_specific(self):
+        for question in ("Are the pods in my AKS cluster healthy?",
+                         "Check the billing deployment health",
+                         "Check Task Manager's pipeline status"):
+            with self.subTest(question=question):
+                self.assertEqual(route_question(question), "generic")
+
     def test_terraform_review_routes_to_terraform(self):
         self.assertEqual(
             route_question("Review the Terraform configuration in the terraform folder"), "terraform"
