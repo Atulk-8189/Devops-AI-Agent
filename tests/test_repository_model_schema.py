@@ -32,6 +32,8 @@ class RepositoryModelSchemaTests(unittest.TestCase):
             with self.subTest(class_schema=class_schema):
                 description = self.expose("repo_file", "repositoryId", fixtures.RepositoryFileReadTests.schema, class_schema)
                 self.assertIn("The exact repository ID returned by successful, complete, unambiguous repository discovery.", description)
+                self.assertIn("Obtain it from repository_discovery.repository_id", description)
+                self.assertIn("pass that exact value as repo_file.repositoryId", description)
                 self.assertIn("Do not provide the repository name.", description)
                 self.assertIn("Complete repo_repository/list discovery before file access", description)
                 self.assertIn("do not infer IDs from pipeline metadata", description)

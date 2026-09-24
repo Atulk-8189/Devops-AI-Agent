@@ -24,7 +24,11 @@ _FIELDS = {
     "reason_code", "outcome", "duration_ms", "attempt_count", "dispatch_count",
     "remaining_budget", "evidence_status", "truncated", "error_category",
     "budget_type", "limit", "current_usage", "model_call_sequence_number",
+    "action_present", "action_category", "action_allowed",
+    "repository_id_present", "repository_id_verified", "repository_id_category",
 } | API_METADATA_FIELDS
+_ACTION_CATEGORIES = frozenset({"allowed", "missing", "unsupported", "non_string"})
+_REPOSITORY_ID_CATEGORIES = frozenset({"verified_id", "missing", "name_or_unverified", "non_string"})
 
 
 def event_record(event, **fields):
@@ -39,6 +43,18 @@ def event_record(event, **fields):
             result.update(safe_fields(**{key: value}))
         elif key == "truncated":
             if type(value) is bool:
+                result[key] = value
+        elif key in {"action_present", "action_allowed"}:
+            if type(value) is bool:
+                result[key] = value
+        elif key == "action_category":
+            if value in _ACTION_CATEGORIES:
+                result[key] = value
+        elif key in {"repository_id_present", "repository_id_verified"}:
+            if type(value) is bool:
+                result[key] = value
+        elif key == "repository_id_category":
+            if value in _REPOSITORY_ID_CATEGORIES:
                 result[key] = value
         elif key in {"duration_ms", "attempt_count", "dispatch_count", "remaining_budget", "limit", "current_usage", "model_call_sequence_number"}:
             safe = safe_fields(duration=value)
@@ -151,6 +167,25 @@ def observed_policy(function):
         if state is not None:
             state["attempts"] += 1
         metadata = tool_metadata(call)
+        action_metadata = {}
+        if call.get("name") == "pipelines_definition":
+            from src.policy.policy import READ_ONLY_POLICY
+            args = call.get("args")
+            action_present = isinstance(args, dict) and "action" in args
+            action = args.get("action") if action_present else None
+            if not action_present:
+                action_category = "missing"
+            elif not isinstance(action, str):
+                action_category = "non_string"
+            elif action in READ_ONLY_POLICY["pipelines_definition"]:
+                action_category = "allowed"
+            else:
+                action_category = "unsupported"
+            action_metadata = {
+                "action_present": action_present,
+                "action_category": action_category,
+                "action_allowed": action_category == "allowed",
+            }
         emit("tool_attempt", outcome="attempted", attempt_count=state["attempts"] if state else None, **metadata)
         try:
             result = function(call)
@@ -162,9 +197,9 @@ def observed_policy(function):
                     and type(detail) is str and detail in {"action_not_allowed", "project_mismatch"}):
                 reason = detail
             emit("policy_decision", policy_decision="reject", outcome="rejected",
-                 error_category=safe.category, reason_code=reason, **metadata)
+                 error_category=safe.category, reason_code=reason, **metadata, **action_metadata)
             raise
-        emit("policy_decision", policy_decision="allow", outcome="allowed", **metadata)
+        emit("policy_decision", policy_decision="allow", outcome="allowed", **metadata, **action_metadata)
         return result
     return wrapped
 

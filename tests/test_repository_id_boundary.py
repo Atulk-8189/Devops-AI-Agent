@@ -33,11 +33,16 @@ class RepositoryIdBoundaryTests(unittest.IsolatedAsyncioTestCase):
         records = [json.loads(record.getMessage()) for record in logs.records]
         dispatches = [record for record in records if record["event"] == "mcp_dispatch"]
         policy_decisions = [record for record in records if record["event"] == "policy_decision"]
+        prerequisite = next(record for record in records if record["event"] == "repository_id_prerequisite")
         feedback = client.create.await_args_list[-1].kwargs["messages"][-1]["content"][0]["text"]
-        return file_executions, dispatches, policy_decisions, records, feedback, output
+        return file_executions, dispatches, policy_decisions, prerequisite, records, feedback, output
 
     async def test_exact_verified_id_reaches_mcp(self):
-        executions, dispatches, decisions, records, _, output = await self.run_case("repo-123")
+        executions, dispatches, decisions, prerequisite, records, _, output = await self.run_case("repo-123")
+        self.assertEqual(
+            {key: prerequisite[key] for key in ("repository_id_present", "repository_id_verified", "repository_id_category")},
+            {"repository_id_present": True, "repository_id_verified": True, "repository_id_category": "verified_id"},
+        )
         self.assertEqual(executions, [("get_content", "My Project", "repo-123", "main", "Branch")])
         self.assertEqual([record["tool_name"] for record in dispatches], ["repo_repository", "repo_file"])
         self.assertEqual([record["policy_decision"] for record in decisions], ["allow", "allow"])
@@ -45,7 +50,10 @@ class RepositoryIdBoundaryTests(unittest.IsolatedAsyncioTestCase):
         output.assert_called_once_with("No file was accessed.")
 
     async def test_repository_name_is_blocked_before_mcp(self):
-        executions, dispatches, decisions, records, feedback, _ = await self.run_case("My Project")
+        executions, dispatches, decisions, prerequisite, records, feedback, _ = await self.run_case("My Project")
+        self.assertEqual(prerequisite["repository_id_present"], True)
+        self.assertEqual(prerequisite["repository_id_verified"], False)
+        self.assertEqual(prerequisite["repository_id_category"], "name_or_unverified")
         self.assertEqual(executions, [])
         self.assertEqual([record["tool_name"] for record in dispatches], ["repo_repository"])
         self.assertEqual([record["policy_decision"] for record in decisions], ["allow", "allow"])
@@ -54,22 +62,62 @@ class RepositoryIdBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(record["event"] == "schema_validation_failed" for record in records))
 
     async def test_wrong_id_is_blocked_before_mcp(self):
-        executions, dispatches, _, records, feedback, _ = await self.run_case("repo-999")
+        executions, dispatches, _, prerequisite, records, feedback, _ = await self.run_case("repo-999")
+        self.assertEqual(prerequisite["repository_id_present"], True)
+        self.assertEqual(prerequisite["repository_id_verified"], False)
+        self.assertEqual(prerequisite["repository_id_category"], "name_or_unverified")
         self.assertEqual(executions, [])
         self.assertEqual([record["tool_name"] for record in dispatches], ["repo_repository"])
         self.assertIn("Repository discovery required", feedback)
         self.assertFalse(any(record["event"] == "schema_validation_failed" for record in records))
 
     async def test_missing_id_fails_schema_validation_before_prerequisite(self):
-        executions, dispatches, _, records, feedback, _ = await self.run_case()
+        executions, dispatches, _, prerequisite, records, feedback, _ = await self.run_case()
+        self.assertEqual(prerequisite["repository_id_present"], False)
+        self.assertEqual(prerequisite["repository_id_verified"], False)
+        self.assertEqual(prerequisite["repository_id_category"], "missing")
         self.assertEqual(executions, [])
         self.assertEqual([record["tool_name"] for record in dispatches], ["repo_repository"])
         self.assertIn("arguments for 'repo_file' are invalid", feedback)
         self.assertTrue(any(record["event"] == "schema_validation_failed" for record in records))
 
+    async def test_non_string_id_is_classified_before_schema_validation(self):
+        executions, dispatches, _, prerequisite, records, feedback, _ = await self.run_case(7)
+        self.assertEqual(executions, [])
+        self.assertEqual([record["tool_name"] for record in dispatches], ["repo_repository"])
+        self.assertEqual(
+            {key: prerequisite[key] for key in ("repository_id_present", "repository_id_verified", "repository_id_category")},
+            {"repository_id_present": True, "repository_id_verified": False, "repository_id_category": "non_string"},
+        )
+        self.assertIn("arguments for 'repo_file' are invalid", feedback)
+        self.assertTrue(any(record["event"] == "schema_validation_failed" for record in records))
+
     async def test_empty_discovery_state_blocks_verified_id_before_mcp(self):
-        executions, dispatches, _, records, feedback, _ = await self.run_case("repo-123", discover=False)
+        executions, dispatches, _, prerequisite, records, feedback, _ = await self.run_case("repo-123", discover=False)
+        self.assertEqual(prerequisite["repository_id_present"], True)
+        self.assertEqual(prerequisite["repository_id_verified"], False)
+        self.assertEqual(prerequisite["repository_id_category"], "name_or_unverified")
         self.assertEqual(executions, [])
         self.assertEqual(dispatches, [])
         self.assertIn("Repository discovery required", feedback)
         self.assertFalse(any(record["event"] == "schema_validation_failed" for record in records))
+
+    async def test_unrelated_tool_does_not_emit_repository_id_diagnostic(self):
+        @flow.tool("pipelines_definition")
+        async def pipelines_definition(action: str, project: str) -> str:
+            """List pipeline definitions."""
+            return "pipeline: Task Manager - DB Bootstrap"
+
+        client = flow.FakeOpenAIClient([
+            flow.completion(tool_calls=[flow.model_tool_call(
+                "pipelines_definition", '{"action":"list"}', "pipeline-call",
+            )]),
+            flow.completion("Pipeline evidence collected."),
+        ])
+        runtime = flow.FakeRuntime([pipelines_definition])
+        fixture = flow.GenericAgentFlowTests()
+        with fixture.generic_patches(client, runtime), patch("builtins.print"):
+            with self.assertLogs("src.observability", level="INFO") as logs:
+                await main("List pipelines")
+        records = [json.loads(record.getMessage()) for record in logs.records]
+        self.assertFalse(any(record["event"] == "repository_id_prerequisite" for record in records))

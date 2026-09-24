@@ -90,3 +90,50 @@ class PipelinePolicyPublicErrorTests(unittest.TestCase):
                 self.assertEqual(stopped.exception.code, 1)
                 output.assert_called_once_with(
                     "Request failed (policy; policy_blocked). No sensitive diagnostic details are displayed.", flush=True)
+
+
+class PipelineActionDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    async def check_action(self, arguments, expected):
+        call = {"name": "pipelines_definition", "args": dict(arguments), "id": "action-test"}
+
+        @observed_request
+        async def request():
+            try:
+                enforce_read_only_policy(call)
+            except PermissionError:
+                pass
+
+        with self.assertLogs("src.observability", level="INFO") as logs:
+            await request()
+        records = [json.loads(record.getMessage()) for record in logs.records]
+        decision = next(record for record in records if record["event"] == "policy_decision")
+        self.assertEqual(
+            {key: decision[key] for key in ("action_present", "action_category", "action_allowed")},
+            expected,
+        )
+        self.assertNotIn("action", decision)
+        return decision
+
+    async def test_allowed_action_classification(self):
+        await self.check_action(
+            {"action": "list", "project": "My Project"},
+            {"action_present": True, "action_category": "allowed", "action_allowed": True},
+        )
+
+    async def test_unsupported_action_classification(self):
+        await self.check_action(
+            {"action": "list_revisions", "project": "My Project"},
+            {"action_present": True, "action_category": "unsupported", "action_allowed": False},
+        )
+
+    async def test_missing_action_classification(self):
+        await self.check_action(
+            {"project": "My Project"},
+            {"action_present": False, "action_category": "missing", "action_allowed": False},
+        )
+
+    async def test_non_string_action_classification(self):
+        await self.check_action(
+            {"action": 7, "project": "My Project"},
+            {"action_present": True, "action_category": "non_string", "action_allowed": False},
+        )

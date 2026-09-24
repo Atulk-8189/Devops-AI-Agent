@@ -971,7 +971,9 @@ class RepositoryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         envelope = json.loads(client.create.await_args_list[1].kwargs["messages"][-1]["content"][0]["text"])
         self.assertEqual(json.loads(envelope["content"][0]["text"]), rows)
         self.assertEqual(files, [])
-        self.assertEqual(self.report(client)["status"], "listed")
+        summary = self.report(client)
+        self.assertEqual(summary["status"], "listed")
+        self.assertNotIn("file_access_repository_id", summary)
 
     async def test_exact_selection_and_discovered_id_prerequisite(self):
         execute, files, client, _ = await self.run_discovery(
@@ -979,7 +981,16 @@ class RepositoryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             [("repo_repository", {"action": "list", "repoNameFilter": "app"}),
              ("repo_file", {"action": "get_content", "repositoryId": "chosen"})],
         )
-        self.assertEqual(self.report(client)["repository_id"], "chosen")
+        summary = self.report(client)
+        self.assertEqual(summary["repository_id"], "chosen")
+        self.assertEqual(
+            summary["file_access_repository_id"],
+            "Use repository_discovery.repository_id as repo_file.repositoryId.",
+        )
+        self.assertEqual(
+            [key for key in summary if "id" in key.lower()],
+            ["repository_id", "file_access_repository_id"],
+        )
         self.assertEqual(files, [("get_content", "My Project", "chosen", "main", "Branch")])
 
     async def test_not_found_and_ambiguity_block_file_operations(self):

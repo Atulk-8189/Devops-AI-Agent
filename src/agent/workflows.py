@@ -98,7 +98,9 @@ def openai_tools(tools):
             if tool.name == "repo_file" and "repositoryId" in properties:
                 properties["repositoryId"]["description"] = (
                     "The exact repository ID returned by successful, complete, unambiguous repository discovery. "
-                    "Do not provide the repository name. Complete repo_repository/list discovery before file access; "
+                    "Obtain it from repository_discovery.repository_id and pass that exact value as "
+                    "repo_file.repositoryId. Do not provide the repository name. Never use the repository name. "
+                    "Complete repo_repository/list discovery before file access; "
                     "do not infer IDs from pipeline metadata."
                 )
             elif tool.name == "repo_repository" and "repoNameFilter" in properties:
@@ -189,6 +191,24 @@ def validation_error_message(tool_name):
         f"Tool arguments for '{tool_name}' are invalid. Review that tool's schema, correct the "
         "arguments, and try one read-only call."
     )
+
+
+def repository_id_metadata(arguments, allowed_ids):
+    repository_id = arguments.get("repositoryId") if isinstance(arguments, dict) else None
+    present = repository_id is not None
+    if not present:
+        category = "missing"
+    elif not isinstance(repository_id, str):
+        category = "non_string"
+    elif repository_id in allowed_ids:
+        category = "verified_id"
+    else:
+        category = "name_or_unverified"
+    return {
+        "repository_id_present": present,
+        "repository_id_verified": category == "verified_id",
+        "repository_id_category": category,
+    }
 
 
 def is_hard_tool_error(error):
@@ -431,6 +451,9 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
                     "tool_name": call["name"],
                     "content": validation_error_message(call["name"]),
                 }}
+            if call["name"] == "repo_file":
+                emit("repository_id_prerequisite",
+                     **repository_id_metadata(call["args"], repository_discovery.allowed_ids))
             try:
                 validate_tool_arguments(tool, call["args"])
             except ToolArgumentValidationError:
@@ -510,6 +533,10 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
                             call["args"], message.content,
                             truncated=normalize_successful_tool_result(message)["truncated"],
                         )
+                        if summary.get("status") == "selected":
+                            summary["file_access_repository_id"] = (
+                                "Use repository_discovery.repository_id as repo_file.repositoryId."
+                            )
                         content = message.content
                         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else list(content)
                         blocks.append({"type": "text", "text": json.dumps({"repository_discovery": summary})})
