@@ -65,7 +65,9 @@ async def orchestrate_request(question, *, task_context=None, context_enabled=Fa
         if route == "generic" and task_context is not None and task_context.topic in {"aks", "terraform"}:
             route = task_context.topic
         select_route(route)
+        from src.agent.ado_pipeline_yaml import handle_pipeline_yaml
         handler = {"generic": workflows.handle_generic, "aks": workflows.handle_aks,
+                   "azure_devops": handle_pipeline_yaml,
                    "terraform": workflows.handle_terraform}[route]
         return await handler(client, runtime.tools, question, hints=hints,
                              task_context=task_context, context_enabled=context_enabled, services=services)

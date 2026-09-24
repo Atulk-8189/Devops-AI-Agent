@@ -242,6 +242,9 @@ def recoverable_tool_error_message(tool_name, error):
 
 
 def route_question(question):
+    from src.agent.ado_pipeline_yaml import pipeline_yaml_request
+    if pipeline_yaml_request(question):
+        return "azure_devops"
     if is_task_manager_troubleshooting_question(question):
         return "aks"
     if "review" in question.lower() and "terraform" in question.lower():
