@@ -1,23 +1,37 @@
 """Offline coverage for the verified repository ID file-access boundary."""
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import test_openai_flow as flow
 from src.agent.main import main
 
 
 class RepositoryIdBoundaryTests(unittest.IsolatedAsyncioTestCase):
-    async def run_case(self, repository_id=None, *, discover=True, expected_feedback=None):
+    async def run_case(self, repository_id=None, *, discover=True, expected_feedback=None,
+                       exact_name=None, rows=None, wrapped=False, directory_first=False):
         file_executions = []
         tools = [flow.json_schema_repo_file_tool(file_executions)]
         responses = []
         if discover:
-            tools.insert(0, flow.repository_tool([{"id": "repo-123", "name": "My Project"}]))
-            responses.append(flow.discovery_completion())
+            data = rows if rows is not None else [{"id": "repo-123", "name": "My Project"}]
+            content = json.dumps(data)
+            if wrapped:
+                content = "<<listing>>Untrusted data\n" + content + "\n<</listing>>"
+            tools.insert(0, flow.repository_tool(execute=AsyncMock(return_value=[
+                {"type": "text", "text": content}])))
+            args = {"action": "list"}
+            if exact_name is not None:
+                args["repoNameFilter"] = exact_name
+            responses.append(flow.completion(tool_calls=[flow.model_tool_call(
+                "repo_repository", json.dumps(args), "discovery")]))
         file_arguments = {"action": "get_content"}
         if repository_id is not None:
             file_arguments["repositoryId"] = repository_id
+        if directory_first:
+            responses.append(flow.completion(tool_calls=[flow.model_tool_call(
+                "repo_file", json.dumps(dict(file_arguments, action="list_directory",
+                                             version="other", versionType="Tag")), "directory-call")]))
         responses.append(flow.completion(tool_calls=[flow.model_tool_call(
             "repo_file", json.dumps(file_arguments), "file-call",
         )]))
@@ -36,6 +50,47 @@ class RepositoryIdBoundaryTests(unittest.IsolatedAsyncioTestCase):
         prerequisite = next(record for record in records if record["event"] == "repository_id_prerequisite")
         feedback = client.create.await_args_list[-1].kwargs["messages"][-1]["content"][0]["text"]
         return file_executions, dispatches, policy_decisions, prerequisite, records, feedback, output
+
+    async def test_exact_selected_name_handed_off_as_verified_id(self):
+        executions, dispatches, _, prerequisite, _, _, _ = await self.run_case(
+            "My Project", exact_name="My Project", wrapped=True)
+        self.assertEqual(executions, [("get_content", "My Project", "repo-123", "main", "Branch")])
+        self.assertTrue(prerequisite["repository_id_verified"])
+        self.assertEqual(len(dispatches), 2)
+
+    async def test_directory_then_file_share_verified_id_and_main_branch(self):
+        executions, dispatches, *_ = await self.run_case(
+            "My Project", exact_name="My Project", wrapped=True, directory_first=True)
+        self.assertEqual(executions, [
+            ("list_directory", "My Project", "repo-123", "main", "Branch"),
+            ("get_content", "My Project", "repo-123", "main", "Branch"),
+        ])
+        self.assertEqual(len(dispatches), 3)
+
+    async def test_selection_does_not_override_missing_or_substituted_references(self):
+        for reference in (None, "invented-id", "other-repository", "my project"):
+            with self.subTest(reference=reference):
+                executions, dispatches, *_ = await self.run_case(reference, exact_name="My Project")
+                self.assertEqual(executions, [])
+                self.assertEqual(len(dispatches), 1)
+
+    async def test_missing_ambiguous_partial_and_nonexact_discovery_cannot_handoff(self):
+        for rows in ([], [{"id": "repo-123", "name": "My Project Extra"}],
+                     [{"id": "a", "name": "My Project"}, {"id": "b", "name": "My Project"}],
+                     [{"id": "repo-123", "name": "My Project"}] * 100):
+            with self.subTest(count=len(rows)):
+                executions, dispatches, *_ = await self.run_case(
+                    "My Project", exact_name="My Project", rows=rows, wrapped=True)
+                self.assertEqual(executions, [])
+                self.assertEqual(len(dispatches), 1)
+
+    async def test_handoff_state_does_not_cross_requests(self):
+        executions, *_ = await self.run_case("My Project", exact_name="My Project")
+        self.assertEqual(len(executions), 1)
+        for reference in ("My Project", "repo-123"):
+            executions, dispatches, *_ = await self.run_case(reference, discover=False)
+            self.assertEqual(executions, [])
+            self.assertEqual(dispatches, [])
 
     async def test_exact_verified_id_reaches_mcp(self):
         executions, dispatches, decisions, prerequisite, records, _, output = await self.run_case("repo-123")

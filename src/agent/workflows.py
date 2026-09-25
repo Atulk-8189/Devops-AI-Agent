@@ -436,6 +436,9 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
         tool_calls = parse_openai_tool_calls(message)
         for call in tool_calls:
             enforce_read_only_policy(call)
+            if call["name"] == "repo_file" and "repositoryId" in call["args"]:
+                call["args"]["repositoryId"] = repository_discovery.file_repository_id(
+                    call["args"]["repositoryId"])
             normalized_call = (call["name"], json.dumps(
                 call["args"], sort_keys=True, separators=(",", ":"), default=str,
             ))
@@ -508,7 +511,7 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
     async def execute_tool(state: State):
         call = state["messages"][-1].tool_calls[0]
         if call["name"] == "repo_repository":
-            repository_discovery.allowed_ids.clear()
+            repository_discovery.clear_verified()
         try:
             emit("evidence_collection", outcome="started", tool_call_id=call["id"])
             result = await mcp_call(call, lambda: tool_node.ainvoke(state),
@@ -529,7 +532,7 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
                             raise RuntimeError(label + safe.user_message()) from None
                         message.content = recoverable_tool_error_message(call["name"], error)
             if call["name"] == "repo_repository":
-                repository_discovery.allowed_ids.clear()
+                repository_discovery.clear_verified()
                 for message in result["messages"]:
                     if isinstance(message, ToolMessage) and message.status == "success":
                         summary = repository_discovery.record(
@@ -545,7 +548,7 @@ async def handle_generic(client, tools, question, *, hints, task_context, contex
                         blocks.append({"type": "text", "text": json.dumps({"repository_discovery": summary})})
                         message.content = blocks
                         if normalize_successful_tool_result(message)["truncated"]:
-                            repository_discovery.allowed_ids.clear()
+                            repository_discovery.clear_verified()
                     else:
                         repository_discovery.pages.clear()
             for message in result["messages"]:
