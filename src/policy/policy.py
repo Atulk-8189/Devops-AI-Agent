@@ -42,6 +42,9 @@ KUBERNETES_RESOURCES = frozenset({
     "events", "networkpolicies", "configmaps", "jobs", "cronjobs", "nodes", "horizontalpodautoscalers",
     "persistentvolumeclaims",
 })
+# Resources that are cluster-scoped (no namespace in metadata).
+# The namespace-enforcement gate in the evidence collector skips these.
+CLUSTER_SCOPED_RESOURCES = frozenset({"nodes"})
 SHELL_METACHARACTERS = frozenset({";", "|", "&", "<", ">", "`", "$", "(", ")", "\\", "\n", "\r"})
 SAFE_KUBERNETES_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$", re.IGNORECASE)
 SAFE_SELECTOR = re.compile(r"^[A-Za-z0-9._/!=(),-]+$")
@@ -61,7 +64,7 @@ def _parse_arguments(value):
         raise PermissionError("Tool call blocked by read-only policy") from exc
 
 
-def _validate_kubectl_arguments(args):
+def _validate_kubectl_arguments(args, resource=None):
     """Allow a deliberately small, namespace-bound kubectl resource grammar."""
     tokens = _parse_arguments(args)
     namespace = None
@@ -101,8 +104,12 @@ def _validate_kubectl_arguments(args):
         elif token.startswith("-") or not SAFE_KUBERNETES_NAME.fullmatch(token):
             raise PermissionError("Tool call blocked by read-only policy")
         index += 1
-    if namespace != ALLOWED_NAMESPACE:
-        raise PermissionError("Tool call blocked by read-only policy")
+    if resource in CLUSTER_SCOPED_RESOURCES:
+        if namespace is not None and namespace != ALLOWED_NAMESPACE:
+            raise PermissionError("Tool call blocked by read-only policy")
+    else:
+        if namespace != ALLOWED_NAMESPACE:
+            raise PermissionError("Tool call blocked by read-only policy")
 
 
 def _validate_aks_arguments(args):
@@ -123,9 +130,10 @@ def enforce_read_only_policy(call):
         if args.get("operation") not in AKS_READ_ONLY_POLICY[name]:
             raise PermissionError("Tool call blocked by read-only policy")
         if name == "kubectl_resources":
-            if args.get("resource", "").lower() not in KUBERNETES_RESOURCES:
+            resource = args.get("resource", "").lower()
+            if resource not in KUBERNETES_RESOURCES:
                 raise PermissionError("Tool call blocked by read-only policy")
-            _validate_kubectl_arguments(args.get("args"))
+            _validate_kubectl_arguments(args.get("args"), resource=resource)
         elif name == "az_aks_operations":
             _validate_aks_arguments(args.get("args"))
         else:

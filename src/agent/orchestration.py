@@ -67,6 +67,7 @@ async def orchestrate_request(question, *, task_context=None, context_enabled=Fa
         select_route(route)
         from src.agent.ado_pipeline_yaml import handle_pipeline_yaml
         handler = {"generic": workflows.handle_generic, "aks": workflows.handle_aks,
+                   "aks_cluster_health": workflows.handle_aks_cluster_health,
                    "azure_devops": handle_pipeline_yaml,
                    "terraform": workflows.handle_terraform}[route]
         return await handler(client, runtime.tools, question, hints=hints,

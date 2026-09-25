@@ -9,7 +9,7 @@ from uuid import uuid4
 from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
-from src.policy.policy import enforce_read_only_policy
+from src.policy.policy import enforce_read_only_policy, CLUSTER_SCOPED_RESOURCES
 from src.config import ConfigurationError
 from src.mcp.runtime import MCPRuntimeError
 from src.agent.aks_network import network_evidence
@@ -205,7 +205,7 @@ def _invalid_resource(payload: Any, resource: str) -> str | None:
         return "unsupported_response_format"
     if resource_missing(payload):
         return None
-    listing = resource in {"pods", "replicasets", "events", "endpointslices", "networkpolicies"}
+    listing = resource in {"pods", "replicasets", "events", "endpointslices", "networkpolicies", "nodes"}
     items = payload.get("items") if listing else [payload]
     if not isinstance(items, list):
         return "unsupported_response_format"
@@ -218,8 +218,9 @@ def _invalid_resource(payload: Any, resource: str) -> str | None:
         metadata = item.get("metadata")
         if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str) or not metadata["name"]:
             return "missing_resource_metadata"
-        if metadata.get("namespace") != NAMESPACE:
-            return "namespace_mismatch" if "namespace" in metadata else "namespace_unverified"
+        if resource not in CLUSTER_SCOPED_RESOURCES:
+            if metadata.get("namespace") != NAMESPACE:
+                return "namespace_mismatch" if "namespace" in metadata else "namespace_unverified"
         if resource == "deployments" and metadata["name"] != DEPLOYMENT:
             return "workload_identity_mismatch"
         if resource in {"deployments", "replicasets", "pods"}:
@@ -729,9 +730,241 @@ def is_task_manager_troubleshooting_question(question: str) -> bool:
     return existing_intent or bool(health_check)
 
 
+def is_aks_cluster_health_question(question: str) -> bool:
+    """True for general, cluster-wide AKS health requests (no specific workload name required).
+
+    Does not fire when the question already matches the Task Manager troubleshooting
+    predicate, or when it mentions ADO pipelines / repositories / Terraform (those
+    routes own those intents).  Requires both a cluster-context keyword and an
+    explicit health/investigation intent to avoid routing casual mentions.
+    """
+    normalized = question.lower().replace("-", " ")
+    # Source / config / pipeline / terraform intents stay on their own routes.
+    if re.search(r"\b(?:repositories|repository|repo|pipelines?|terraform)\b", normalized):
+        return False
+    # Must reference the cluster/infrastructure context.
+    cluster_context = re.search(r"\b(?:aks|cluster|kubernetes)\b", normalized)
+    # Must express a health or investigation intent.
+    health_intent = re.search(
+        r"\b(?:health|healthy|unhealthy|node.?status|pod.?status|workloads?|"
+        r"investigate|check|inspect|status|problems?|issues?|diagnose|troubleshoot)\b",
+        normalized,
+    )
+    return bool(cluster_context and health_intent)
+
+
+CLUSTER_HEALTH_SCOPE = {
+    "node_health_scope": "cluster-wide",
+    "pod_health_scope": "namespace: default",
+    "scope_limitations": (
+        "Node health is checked cluster-wide across all cluster nodes. "
+        "Pod health is checked only in the authorized 'default' namespace. "
+        "System namespaces (including kube-system) and other namespaces were not inspected by security policy."
+    ),
+}
+
+
+@dataclass
+class ClusterHealthEvidence:
+    """Lightweight cluster-wide health observations; intentionally makes no diagnosis."""
+
+    steps: list[EvidenceStep] = field(default_factory=list)
+    cluster_state: dict[str, Any] = field(default_factory=dict)
+    node_health: dict[str, Any] = field(default_factory=dict)
+    pod_health: dict[str, Any] = field(default_factory=dict)
+    inspection_scope: dict[str, Any] = field(default_factory=lambda: dict(CLUSTER_HEALTH_SCOPE))
+    stop_reason: str | None = None
+    collection_calls: int = 0
+    budget_exhausted: bool = False
+
+    def model_input(self) -> str:
+        """Serialize the focused cluster-health report."""
+        report = {
+            "inspection_scope": self.inspection_scope,
+            "cluster_state": self.cluster_state,
+            "node_health": self.node_health,
+            "pod_health": self.pod_health,
+            "decision": {
+                "stop_reason": self.stop_reason,
+                "collection_calls": self.collection_calls,
+                "budget_exhausted": self.budget_exhausted,
+            },
+        }
+        return bounded_evidence(report)
+
+
+MAX_CLUSTER_HEALTH_CALLS = 4
+
+
+def _evaluate_nodes(payload: Any, parser_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Summarise node readiness from a kubectl get nodes -o json response."""
+    if parser_metadata and parser_metadata.get("state") == "unknown":
+        return _unknown_state(parser_metadata.get("reason", "unsupported_response_format"), parser_metadata)
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        return _unknown_state("unsupported_response_format", parser_metadata)
+    items = payload["items"]
+    if not items:
+        return {"state": "missing", "nodes": [], "unhealthy_nodes": []}
+    nodes, unhealthy = [], []
+    for node in items:
+        if not isinstance(node, dict):
+            return _unknown_state("invalid_node_object", parser_metadata)
+        metadata = node.get("metadata", {})
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        if not isinstance(name, str) or not name:
+            return _unknown_state("missing_node_metadata", parser_metadata)
+        status = node.get("status", {}) if isinstance(node, dict) else {}
+        conditions = status.get("conditions", []) if isinstance(status, dict) else []
+        ready_condition = next(
+            (c.get("status") for c in conditions if isinstance(c, dict) and c.get("type") == "Ready"),
+            None,
+        )
+        ready = ready_condition == "True"
+        item = {
+            "name": _redact_text(name),
+            "ready": ready,
+            "ready_condition": ready_condition,
+            "conditions": _conditions(conditions),
+        }
+        nodes.append(item)
+        if not ready:
+            unhealthy.append(item)
+    state = "healthy" if not unhealthy else "unhealthy"
+    return {"state": state, "node_count": len(nodes), "nodes": nodes, "unhealthy_nodes": unhealthy}
+
+
+async def collect_aks_cluster_health_evidence(tools, log=print) -> ClusterHealthEvidence:
+    """Deterministic read-only AKS cluster-health collector.
+
+    Tool call sequence (max MAX_CLUSTER_HEALTH_CALLS):
+      1. az_aks_operations / show  — cluster provisioning state
+      2. kubectl_resources / get nodes  — node readiness
+      3. kubectl_resources / get pods (namespace default)  — sampled pod health
+
+    All calls go through enforce_read_only_policy.  No MCP writes are performed.
+    """
+    evidence = ClusterHealthEvidence()
+    by_name = {tool.name: tool for tool in tools}
+    if "kubectl_resources" not in by_name:
+        raise RuntimeError("AKS MCP did not expose the approved kubectl_resources tool")
+
+    def hard_failure(error):
+        from src.request_budget import RequestBoundExceeded
+        if isinstance(error, RequestBoundExceeded):
+            return True
+        return isinstance(error, (PermissionError, ConfigurationError, MCPRuntimeError)) or any(
+            marker in f"{type(error).__name__} {error}".lower() for marker in (
+                "authentication", "authorization", "unauthorized", "forbidden", "credential",
+                "permission", "security", "access denied", "api key", "api_key", "bearer token",
+                "token expired", "401", "403",
+            )
+        )
+
+    async def invoke(name: str, operation: str, resource: str, args: str, step_name: str):
+        call = {"name": name, "args": {"operation": operation, "resource": resource, "args": args},
+                "id": str(uuid4()), "type": "tool_call"}
+        enforce_read_only_policy(call)
+        if evidence.collection_calls >= MAX_CLUSTER_HEALTH_CALLS:
+            evidence.steps.append(EvidenceStep(step_name, operation, resource, args, "not_collected",
+                                               parser_metadata={"state": "unknown", "reason": "collection_budget_exhausted"}))
+            evidence.budget_exhausted = True
+            return None
+        log(diagnostic_line(event="collection_allowed", tool_name=name, operation=operation, outcome="allowed"))
+        evidence.collection_calls += 1
+        try:
+            from src.observability import mcp_call
+            result = await mcp_call(call, lambda: by_name[name].ainvoke(call),
+                                    remaining_budget=MAX_CLUSTER_HEALTH_CALLS - evidence.collection_calls)
+        except Exception as error:
+            if hard_failure(error):
+                raise
+            evidence.steps.append(EvidenceStep(
+                step_name, operation, resource, args, "error",
+                parser_metadata={"state": "unknown", "reason": "tool_transport_failure"},
+            ))
+            return None
+        if not isinstance(result, ToolMessage):
+            evidence.steps.append(EvidenceStep(
+                step_name, operation, resource, args, "unknown",
+                parser_metadata={"state": "unknown", "reason": "invalid_tool_response"},
+            ))
+            return None
+        payload, parser_metadata = normalize_kubernetes_response(result.content)
+        if result.status == "error" and hard_failure(RuntimeError(unwrap_tool_content(result.content))):
+            safe = classify_error(RuntimeError(unwrap_tool_content(result.content)), boundary="tool")
+            raise PermissionError(safe.user_message())
+        if result.status == "error":
+            payload = None
+            parser_metadata = {"state": "unknown", "reason": "tool_failure"}
+        elif payload is not None:
+            invalid = _invalid_resource(payload, resource)
+            if invalid:
+                payload = None
+                parser_metadata.update(state="unknown", reason=invalid)
+        outcome = (
+            "error" if result.status == "error" else
+            "unknown" if parser_metadata.get("state") == "unknown" else "ok"
+        )
+        step = EvidenceStep(step_name, operation, resource, args, outcome, payload,
+                            parser_metadata=parser_metadata)
+        evidence.steps.append(step)
+        return payload
+
+    # --- Step 1: cluster provisioning state (az_aks_operations/show) ---
+    if "az_aks_operations" in by_name:
+        call = {"name": "az_aks_operations",
+                "args": {"operation": "show", "resource": "", "args": ""},
+                "id": str(uuid4()), "type": "tool_call"}
+        try:
+            enforce_read_only_policy(call)
+            evidence.collection_calls += 1
+            from src.observability import mcp_call
+            result = await mcp_call(call, lambda: by_name["az_aks_operations"].ainvoke(call),
+                                    remaining_budget=MAX_CLUSTER_HEALTH_CALLS - evidence.collection_calls)
+            if isinstance(result, ToolMessage) and result.status != "error":
+                raw = unwrap_tool_content(result.content)
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        evidence.cluster_state = {
+                            "name": parsed.get("name"),
+                            "provisioningState": parsed.get("provisioningState"),
+                            "powerState": parsed.get("powerState", {}).get("code") if isinstance(parsed.get("powerState"), dict) else None,
+                            "kubernetesVersion": parsed.get("kubernetesVersion"),
+                            "location": parsed.get("location"),
+                        }
+                except (TypeError, ValueError):
+                    evidence.cluster_state = {"state": "unknown", "reason": "unparseable_cluster_response"}
+        except Exception as error:
+            if hard_failure(error):
+                raise
+            evidence.cluster_state = {"state": "unknown", "reason": "cluster_show_failed"}
+    else:
+        evidence.cluster_state = {"state": "unknown", "reason": "az_aks_operations_unavailable"}
+
+    # --- Step 2: node status ---
+    nodes = await invoke("kubectl_resources", "get", "nodes", "-o json", "nodes")
+    node_step = _step_from(evidence.steps, "nodes")
+    evidence.node_health = _evaluate_nodes(nodes, node_step.parser_metadata if node_step else None)
+
+    # --- Step 3: pod status in default namespace ---
+    pods = await invoke("kubectl_resources", "get", "pods", f"--namespace {NAMESPACE} -o json", "pods")
+    pod_step = _step_from(evidence.steps, "pods")
+    evidence.pod_health = evaluate_pods(pods, pod_step.parser_metadata if pod_step else None)
+
+    if evidence.budget_exhausted:
+        evidence.stop_reason = "AKS cluster-health collection budget exhausted; some evidence was not collected."
+    return evidence
+
+
+def _step_from(steps: list[EvidenceStep], name: str) -> EvidenceStep | None:
+    return next((s for s in steps if s.name == name), None)
+
+
 def _redact_text(value: Any, limit=500) -> str:
     """Keep diagnostic messages useful without returning credential-looking values."""
     return _SENSITIVE_VALUE.sub(lambda match: f"{match.group(1)}=[REDACTED]", str(value))[:limit]
+
 
 
 def _metadata(item: Any) -> dict[str, Any]:

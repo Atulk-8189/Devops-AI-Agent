@@ -943,3 +943,331 @@ Environment:
                 "id": "test",
                 "type": "tool_call",
             })
+
+
+# ---------------------------------------------------------------------------
+# General AKS cluster-health workflow
+# ---------------------------------------------------------------------------
+from src.agent.aks_troubleshooting import (
+    ClusterHealthEvidence,
+    collect_aks_cluster_health_evidence,
+    _evaluate_nodes,
+    MAX_CLUSTER_HEALTH_CALLS,
+    CLUSTER_HEALTH_SCOPE,
+)
+from src.policy.policy import CLUSTER_SCOPED_RESOURCES
+
+
+def _node(name="aks-nodepool1-12345678-vmss000000", ready=True):
+    """Minimal kubectl get nodes item."""
+    return {
+        "metadata": {"name": name},
+        "status": {
+            "conditions": [
+                {"type": "Ready", "status": "True" if ready else "False", "reason": "KubeletReady"},
+            ],
+        },
+    }
+
+
+def _nodes(*items):
+    return {"items": list(items)}
+
+
+class FakeAKSMCPTool:
+    """Minimal fake supporting both kubectl_resources and az_aks_operations."""
+
+    def __init__(self, kubectl_responses=None, aks_response=None):
+        self.kubectl_responses = dict(kubectl_responses or {})
+        self.aks_response = aks_response
+        self.calls = []
+
+    @property
+    def name(self):
+        # Returns a fixed name; actual dispatch uses by_name lookup in the collector.
+        return "kubectl_resources"
+
+    async def ainvoke(self, call):
+        self.calls.append(call)
+        tool = call["name"]
+        if tool == "az_aks_operations":
+            payload = self.aks_response or {"name": "aks-dev", "provisioningState": "Succeeded"}
+            return ToolMessage(content=json.dumps(payload), tool_call_id=call["id"], name=tool, status="success")
+        resource = call["args"]["resource"]
+        response = self.kubectl_responses.get(resource, {"items": []})
+        if isinstance(response, list):
+            response = response.pop(0)
+        return ToolMessage(content=json.dumps(response), tool_call_id=call["id"], name=tool, status="success")
+
+
+def _make_tools(kubectl_responses=None, aks_response=None):
+    """Return a list of fake tools matching the AKS MCP tool set."""
+    tool = FakeAKSMCPTool(kubectl_responses, aks_response)
+    # Create two separate objects so by_name lookup works for both tool names.
+    class FakeAKSOps:
+        name = "az_aks_operations"
+        ainvoke = tool.ainvoke
+    class FakeKubectl:
+        name = "kubectl_resources"
+        ainvoke = tool.ainvoke
+    tool._kubectl = FakeKubectl()
+    tool._aks_ops = FakeAKSOps()
+    return [tool._kubectl, tool._aks_ops], tool
+
+
+class AKSClusterHealthTests(unittest.IsolatedAsyncioTestCase):
+
+    # --- _evaluate_nodes ---
+
+    def test_evaluate_nodes_healthy_single_node(self):
+        result = _evaluate_nodes(_nodes(_node("node-1", ready=True)))
+        self.assertEqual(result["state"], "healthy")
+        self.assertEqual(result["node_count"], 1)
+        self.assertEqual(result["unhealthy_nodes"], [])
+        self.assertEqual(result["nodes"][0]["name"], "node-1")
+        self.assertTrue(result["nodes"][0]["ready"])
+
+    def test_evaluate_nodes_unhealthy_node(self):
+        result = _evaluate_nodes(_nodes(_node("node-1", ready=True), _node("node-2", ready=False)))
+        self.assertEqual(result["state"], "unhealthy")
+        self.assertEqual(result["node_count"], 2)
+        self.assertEqual(len(result["unhealthy_nodes"]), 1)
+        self.assertEqual(result["unhealthy_nodes"][0]["name"], "node-2")
+
+    def test_evaluate_nodes_empty_list_is_missing(self):
+        result = _evaluate_nodes({"items": []})
+        self.assertEqual(result["state"], "missing")
+        self.assertEqual(result["nodes"], [])
+
+    def test_evaluate_nodes_invalid_payload_is_unknown(self):
+        for bad in (None, [], "string", {"no_items_key": True}):
+            with self.subTest(bad=bad):
+                result = _evaluate_nodes(bad)
+                self.assertEqual(result["state"], "unknown")
+
+    def test_evaluate_nodes_propagates_parser_metadata_unknown(self):
+        result = _evaluate_nodes({"items": [_node()]}, {"state": "unknown", "reason": "invalid_json"})
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["reason"], "invalid_json")
+
+    def test_evaluate_nodes_missing_node_metadata_is_unknown(self):
+        bad_node = {"status": {"conditions": []}}  # no metadata.name
+        result = _evaluate_nodes({"items": [bad_node]})
+        self.assertEqual(result["state"], "unknown")
+
+    # --- namespace enforcement for cluster-scoped resources ---
+
+    def test_cluster_scoped_resources_contains_nodes(self):
+        self.assertIn("nodes", CLUSTER_SCOPED_RESOURCES)
+
+    def test_nodes_without_namespace_pass_invalid_resource_check(self):
+        """Nodes (cluster-scoped) must not be rejected for missing namespace."""
+        from src.agent.aks_troubleshooting import _invalid_resource
+        node_list = _nodes(_node("node-1"))
+        # Nodes have no 'namespace' key in metadata — must return None (valid).
+        result = _invalid_resource(node_list, "nodes")
+        self.assertIsNone(result)
+
+    def test_namespace_scoped_resources_still_enforce_namespace(self):
+        """Ensuring the cluster-scoped bypass does not affect namespace-scoped resources."""
+        from src.agent.aks_troubleshooting import _invalid_resource
+        pod_list = pods()
+        # Correct namespace: valid.
+        self.assertIsNone(_invalid_resource(pod_list, "pods"))
+        # Wrong namespace: rejected.
+        pod_list["items"][0]["metadata"]["namespace"] = "kube-system"
+        result = _invalid_resource(pod_list, "pods")
+        self.assertEqual(result, "namespace_mismatch")
+
+    # --- collect_aks_cluster_health_evidence ---
+
+    async def test_healthy_cluster_collects_node_and_pod_status(self):
+        tools, fake = _make_tools(
+            kubectl_responses={
+                "nodes": _nodes(_node("node-1", ready=True)),
+                "pods": pods(),
+            },
+            aks_response={"name": "aks-dev", "provisioningState": "Succeeded", "kubernetesVersion": "1.29.0"},
+        )
+        evidence = await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+        self.assertEqual(evidence.node_health["state"], "healthy")
+        self.assertEqual(evidence.pod_health["state"], "healthy")
+        self.assertFalse(evidence.budget_exhausted)
+        # cluster_state should contain provisioning info
+        self.assertEqual(evidence.cluster_state.get("provisioningState"), "Succeeded")
+        self.assertLessEqual(evidence.collection_calls, MAX_CLUSTER_HEALTH_CALLS)
+
+    async def test_unhealthy_node_reported_in_node_health(self):
+        tools, _ = _make_tools(
+            kubectl_responses={"nodes": _nodes(_node("node-1", ready=False)), "pods": pods()},
+        )
+        evidence = await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+        self.assertEqual(evidence.node_health["state"], "unhealthy")
+        self.assertEqual(len(evidence.node_health["unhealthy_nodes"]), 1)
+
+    async def test_unhealthy_pods_reported_in_pod_health(self):
+        tools, _ = _make_tools(
+            kubectl_responses={
+                "nodes": _nodes(_node()),
+                "pods": pods(ready=False, restarts=3),
+            },
+        )
+        evidence = await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+        self.assertEqual(evidence.pod_health["state"], "unhealthy")
+        self.assertEqual(len(evidence.pod_health["unhealthy_pods"]), 1)
+
+    async def test_collector_uses_default_namespace_for_pods(self):
+        """Pod collection must be scoped to namespace default only."""
+        tools, fake = _make_tools(kubectl_responses={"nodes": _nodes(_node()), "pods": pods()})
+        evidence = await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+        pod_calls = [c for c in fake.calls if c["args"]["resource"] == "pods"]
+        self.assertTrue(any("--namespace default" in c["args"]["args"] for c in pod_calls),
+                        "Pod collection must request namespace default")
+        self.assertFalse(any("--all-namespaces" in c["args"]["args"] for c in pod_calls),
+                         "Pod collection must not use --all-namespaces")
+
+    async def test_collector_does_not_exceed_call_budget(self):
+        tools, fake = _make_tools(
+            kubectl_responses={"nodes": _nodes(_node()), "pods": pods()},
+        )
+        evidence = await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+        self.assertLessEqual(evidence.collection_calls, MAX_CLUSTER_HEALTH_CALLS)
+
+    async def test_transport_failure_for_nodes_is_unknown_not_unhealthy(self):
+        tools, fake = _make_tools()
+        original = fake.ainvoke
+
+        async def fail_nodes(call):
+            if call["args"].get("resource") == "nodes":
+                raise TimeoutError("private transport detail")
+            return await original(call)
+
+        fake._kubectl.ainvoke = fail_nodes
+        fake._aks_ops.ainvoke = fail_nodes
+        evidence = await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+        self.assertEqual(evidence.node_health["state"], "unknown")
+        self.assertNotIn("private transport detail", evidence.model_input())
+
+    async def test_authorization_failure_propagates_as_hard_error(self):
+        tools, fake = _make_tools()
+        original = fake.ainvoke
+
+        async def deny_all(call):
+            raise PermissionError("Access denied")
+
+        fake._kubectl.ainvoke = deny_all
+        fake._aks_ops.ainvoke = deny_all
+        with self.assertRaises(PermissionError):
+            await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+
+    async def test_model_input_is_bounded_json(self):
+        tools, _ = _make_tools(
+            kubectl_responses={"nodes": _nodes(*[_node(f"node-{i}") for i in range(50)]), "pods": pods()},
+        )
+        evidence = await collect_aks_cluster_health_evidence(tools, log=lambda _: None)
+        model_in = evidence.model_input()
+        parsed = json.loads(model_in)
+        self.assertIn("node_health", parsed)
+        self.assertIn("pod_health", parsed)
+        self.assertIn("decision", parsed)
+
+    async def test_missing_az_aks_tool_produces_unknown_cluster_state(self):
+        """If az_aks_operations is absent, cluster_state should be marked unknown."""
+        class FakeKubectlOnly:
+            name = "kubectl_resources"
+
+            def __init__(self, responses):
+                self._responses = responses
+
+            async def ainvoke(self, call):
+                resource = call["args"]["resource"]
+                return ToolMessage(
+                    content=json.dumps(self._responses.get(resource, {"items": []})),
+                    tool_call_id=call["id"], name=self.name, status="success",
+                )
+
+        tool = FakeKubectlOnly({"nodes": _nodes(_node()), "pods": pods()})
+        evidence = await collect_aks_cluster_health_evidence([tool], log=lambda _: None)
+        self.assertEqual(evidence.cluster_state.get("state"), "unknown")
+
+    # --- policy: nodes are allowed by AKS_READ_ONLY_POLICY ---
+
+    def test_policy_allows_kubectl_get_nodes(self):
+        """nodes is in KUBERNETES_RESOURCES and get is in AKS_READ_ONLY_POLICY."""
+        # Should not raise.
+        enforce_read_only_policy({
+            "name": "kubectl_resources",
+            "args": {"operation": "get", "resource": "nodes", "args": "-o json"},
+            "id": "test-nodes",
+            "type": "tool_call",
+        })
+
+    def test_policy_allows_az_aks_operations_show(self):
+        """az_aks_operations/show is explicitly in AKS_READ_ONLY_POLICY."""
+        enforce_read_only_policy({
+            "name": "az_aks_operations",
+            "args": {"operation": "show", "resource": "", "args": ""},
+            "id": "test-aks-show",
+            "type": "tool_call",
+        })
+
+    def test_policy_rejects_kubectl_get_secrets(self):
+        with self.assertRaises(PermissionError):
+            enforce_read_only_policy({
+                "name": "kubectl_resources",
+                "args": {"operation": "get", "resource": "secrets", "args": "-n default -o json"},
+                "id": "test-secrets",
+                "type": "tool_call",
+            })
+
+    def test_policy_rejects_kubectl_resources_all_namespaces(self):
+        with self.assertRaises(PermissionError):
+            enforce_read_only_policy({
+                "name": "kubectl_resources",
+                "args": {"operation": "get", "resource": "pods", "args": "--all-namespaces -o json"},
+                "id": "test-all-ns",
+                "type": "tool_call",
+            })
+
+    def test_policy_rejects_kubectl_exec(self):
+        with self.assertRaises(PermissionError):
+            enforce_read_only_policy({
+                "name": "kubectl_resources",
+                "args": {"operation": "get", "resource": "pods", "args": "exec mypod -- bash"},
+                "id": "test-exec",
+                "type": "tool_call",
+            })
+
+    # --- scope disclosure and evidence grounding ---
+
+    def test_cluster_health_evidence_contains_scope_disclosure(self):
+        """Evidence must explicitly disclose that node health is cluster-wide and pods are default namespace only."""
+        evidence = ClusterHealthEvidence()
+        model_in = json.loads(evidence.model_input())
+        self.assertIn("inspection_scope", model_in)
+        scope = model_in["inspection_scope"]
+        self.assertEqual(scope["node_health_scope"], "cluster-wide")
+        self.assertEqual(scope["pod_health_scope"], "namespace: default")
+        self.assertIn("cluster-wide", scope["scope_limitations"].lower())
+        self.assertIn("default", scope["scope_limitations"].lower())
+        self.assertIn("not inspected", scope["scope_limitations"].lower())
+        self.assertIn("system namespaces", scope["scope_limitations"].lower())
+
+    def test_cluster_health_system_prompt_requires_scope_disclosure(self):
+        """The system prompt must mandate explicit scope disclosure and forbid implying all workloads were checked."""
+        from src.agent.workflows import AKS_CLUSTER_HEALTH_SYSTEM_PROMPT
+        prompt_lower = AKS_CLUSTER_HEALTH_SYSTEM_PROMPT.lower()
+        self.assertIn("node health was checked cluster-wide", prompt_lower)
+        self.assertIn("default", prompt_lower)
+        self.assertIn("system namespaces", prompt_lower)
+        self.assertIn("not inspected", prompt_lower)
+        self.assertIn("never claim or imply that all cluster workloads were checked", prompt_lower)
+
+    def test_cluster_health_fallback_discloses_scope(self):
+        """Fallback diagnosis summary must explicitly state the inspection scope limitations."""
+        from src.agent.workflows import AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY
+        self.assertIn("Node health is checked cluster-wide", AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY)
+        self.assertIn("authorized 'default' namespace", AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY)
+        self.assertIn("system and other namespaces were not inspected", AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY)
+
+
