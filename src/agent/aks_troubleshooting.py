@@ -9,7 +9,7 @@ from uuid import uuid4
 from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
-from src.policy.policy import enforce_read_only_policy, CLUSTER_SCOPED_RESOURCES
+from src.policy.policy import enforce_read_only_policy, CLUSTER_SCOPED_RESOURCES, SAFE_KUBERNETES_NAME
 from src.config import ConfigurationError
 from src.mcp.runtime import MCPRuntimeError
 from src.agent.aks_network import network_evidence
@@ -71,6 +71,7 @@ class TroubleshootingEvidence:
     network_policy_evidence: dict[str, Any] = field(
         default_factory=lambda: {"state": "not_collected"}
     )
+    container_logs: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str | None = None
     collection_calls: int = 0
     budget_exhausted: bool = False
@@ -524,6 +525,96 @@ class _CollectionBudgetReached(Exception):
     pass
 
 
+async def read_container_logs(
+    tools,
+    pod_name: str,
+    container_name: str | None = None,
+    previous: bool = False,
+    tail: int = 100,
+    namespace: str = NAMESPACE,
+    log=print,
+) -> dict[str, Any]:
+    """Safely read read-only logs from a container in the default namespace."""
+    if not isinstance(pod_name, str) or not SAFE_KUBERNETES_NAME.fullmatch(pod_name):
+        raise ValueError(f"Invalid pod name: {pod_name}")
+    if container_name is not None and (not isinstance(container_name, str) or not SAFE_KUBERNETES_NAME.fullmatch(container_name)):
+        raise ValueError(f"Invalid container name: {container_name}")
+    if not isinstance(tail, int) or tail < 1 or tail > 1000:
+        raise ValueError(f"Log tail must be an integer between 1 and 1000, got: {tail}")
+    if namespace != NAMESPACE:
+        raise PermissionError(f"Access to namespace '{namespace}' is forbidden; only '{NAMESPACE}' is permitted.")
+
+    by_name = {tool.name: tool for tool in tools}
+    if "call_kubectl" not in by_name:
+        return {
+            "pod": pod_name,
+            "container": container_name,
+            "namespace": namespace,
+            "log_type": "previous" if previous else "current",
+            "tail": tail,
+            "status": "unavailable",
+            "lines": [],
+            "message": "call_kubectl tool is not available in tools.",
+        }
+
+    cmd_parts = ["kubectl", "logs", pod_name, "-n", namespace]
+    if container_name:
+        cmd_parts.extend(["-c", container_name])
+    if previous:
+        cmd_parts.append("--previous")
+    cmd_parts.append(f"--tail={tail}")
+    command = " ".join(cmd_parts)
+
+    call = {
+        "name": "call_kubectl",
+        "args": {"command": command},
+        "id": str(uuid4()),
+        "type": "tool_call",
+    }
+    enforce_read_only_policy(call)
+    log(diagnostic_line(event="collection_allowed", tool_name="call_kubectl", operation="logs", outcome="allowed"))
+
+    tool = by_name["call_kubectl"]
+    result = await tool.ainvoke(call)
+
+    raw = unwrap_tool_content(result.content if isinstance(result, ToolMessage) else getattr(result, "content", str(result)))
+    is_error = getattr(result, "status", None) == "error"
+    lower_raw = raw.lower()
+
+    if "previous terminated container" in lower_raw or (previous and "not found" in lower_raw):
+        status = "not_found"
+        message = "No previous terminated container found."
+        lines = []
+    elif is_error or lower_raw.startswith("error from server") or lower_raw.startswith("error:"):
+        if "not found" in lower_raw:
+            status = "unavailable"
+            message = f"Container or pod not found: {raw.strip()}"
+            lines = []
+        else:
+            status = "error"
+            message = _redact_text(raw.strip(), limit=500)
+            lines = []
+    elif not raw.strip():
+        status = "empty"
+        message = "Logs are empty."
+        lines = []
+    else:
+        status = "available"
+        lines = [_redact_text(line, limit=500) for line in raw.splitlines() if line.strip()][:tail]
+        message = f"Collected {len(lines)} log lines."
+
+    return {
+        "pod": pod_name,
+        "container": container_name,
+        "namespace": namespace,
+        "log_type": "previous" if previous else "current",
+        "tail": tail,
+        "status": status,
+        "lines": lines,
+        "message": message,
+    }
+
+
 async def collect_task_manager_evidence(tools, log=print) -> TroubleshootingEvidence:
     evidence = TroubleshootingEvidence()
     try:
@@ -651,6 +742,56 @@ async def _collect_task_manager_evidence(tools, evidence, log) -> Troubleshootin
         for pod in evidence.pod_health["unhealthy_pods"]:
             await invoke("kubectl_resources", "describe", "pods",
                          f"{pod['name']} --namespace {NAMESPACE}", f"pod:{pod['name']}")
+    if "call_kubectl" in by_name:
+        for pod in evidence.pod_health.get("pods", []):
+            containers_to_check = pod.get("containers", []) + pod.get("init_containers", [])
+            for c in containers_to_check:
+                c_name = c.get("name")
+                if not c_name:
+                    continue
+                is_unhealthy = (
+                    c.get("active_failure") is True
+                    or c.get("evaluation") == "unhealthy"
+                    or c.get("current_state", {}).get("state") in ("waiting", "terminated")
+                )
+                restarts = c.get("restart_count") or 0
+                if is_unhealthy or restarts > 0:
+                    if evidence.collection_calls >= MAX_AKS_COLLECTION_CALLS:
+                        evidence.steps.append(EvidenceStep(
+                            f"logs:{pod['name']}:{c_name}:current", "logs", "pods",
+                            f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --tail=100", "not_collected",
+                            parser_metadata={"state": "unknown", "reason": "collection_budget_exhausted"},
+                        ))
+                        raise _CollectionBudgetReached
+                    evidence.collection_calls += 1
+                    current_entry = await read_container_logs(
+                        tools, pod["name"], c_name, previous=False, tail=100, namespace=NAMESPACE, log=log
+                    )
+                    evidence.container_logs.append(current_entry)
+                    evidence.steps.append(EvidenceStep(
+                        f"logs:{pod['name']}:{c_name}:current", "logs", "pods",
+                        f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --tail=100", current_entry["status"],
+                        payload=current_entry,
+                    ))
+
+                    if restarts > 0:
+                        if evidence.collection_calls >= MAX_AKS_COLLECTION_CALLS:
+                            evidence.steps.append(EvidenceStep(
+                                f"logs:{pod['name']}:{c_name}:previous", "logs", "pods",
+                                f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --previous --tail=100", "not_collected",
+                                parser_metadata={"state": "unknown", "reason": "collection_budget_exhausted"},
+                            ))
+                            raise _CollectionBudgetReached
+                        evidence.collection_calls += 1
+                        prev_entry = await read_container_logs(
+                            tools, pod["name"], c_name, previous=True, tail=100, namespace=NAMESPACE, log=log
+                        )
+                        evidence.container_logs.append(prev_entry)
+                        evidence.steps.append(EvidenceStep(
+                            f"logs:{pod['name']}:{c_name}:previous", "logs", "pods",
+                            f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --previous --tail=100", prev_entry["status"],
+                            payload=prev_entry,
+                        ))
     await invoke("kubectl_resources", "get", "events", f"--namespace {NAMESPACE} -o json", "events")
 
     if evidence.pod_health["state"] == "unknown":
@@ -1075,6 +1216,7 @@ def _task_manager_evidence_report(evidence: TroubleshootingEvidence) -> dict[str
         "pods": [_pod_summary(item) for item in _items(pod_step.payload if pod_step else None)],
         "pod_evaluation": evidence.pod_health,
         "pod_descriptions": pod_descriptions,
+        "container_logs": evidence.container_logs,
         "events": events["events"],
         "event_collection": {key: value for key, value in events.items() if key != "events"},
         "continued_to_service": service_step is not None,

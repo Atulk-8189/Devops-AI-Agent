@@ -69,3 +69,65 @@ class ReadOnlyPolicyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Duplicate MCP tool names"):
             select_allowed_tools([Tool("repo_file"), Tool("repo_file")])
+
+    def test_call_kubectl_logs_allowed_combinations(self):
+        allowed_commands = [
+            "kubectl logs task-manager-123 -n default",
+            "kubectl logs task-manager-123 --namespace=default",
+            "kubectl logs task-manager-123 -n default -c app",
+            "kubectl logs task-manager-123 -n default --container=app",
+            "kubectl logs task-manager-123 -n default --previous",
+            "kubectl logs task-manager-123 -n default --tail 50",
+            "kubectl logs task-manager-123 -n default --tail=1000",
+            "kubectl logs task-manager-123 -n default -c app --previous --tail 100",
+            "kubectl logs task-manager.frontend_v1 -n default",
+        ]
+        for cmd in allowed_commands:
+            with self.subTest(command=cmd):
+                enforce_read_only_policy(call("call_kubectl", command=cmd))
+
+    def test_call_kubectl_namespace_restrictions(self):
+        forbidden_namespace_commands = [
+            "kubectl logs task-manager-123 -n kube-system",
+            "kubectl logs task-manager-123 -n prod",
+            "kubectl logs task-manager-123 --namespace=ingress-nginx",
+            "kubectl logs task-manager-123",
+            "kubectl logs task-manager-123 --all-namespaces",
+            "kubectl logs task-manager-123 -A",
+            "kubectl logs task-manager-123 -n default -n kube-system",
+        ]
+        for cmd in forbidden_namespace_commands:
+            with self.subTest(command=cmd), self.assertRaises(PermissionError):
+                enforce_read_only_policy(call("call_kubectl", command=cmd))
+
+    def test_call_kubectl_invalid_inputs_and_bounds(self):
+        invalid_commands = [
+            "kubectl logs task-manager-123 -n default --tail 0",
+            "kubectl logs task-manager-123 -n default --tail=1001",
+            "kubectl logs task-manager-123 -n default --tail -10",
+            "kubectl logs task-manager-123 -n default --tail abc",
+            "kubectl logs ../secrets -n default",
+            "kubectl logs task-manager -n default -c ../sidecar",
+            "kubectl logs -n default",
+            "kubectl logs pod1 pod2 -n default",
+        ]
+        for cmd in invalid_commands:
+            with self.subTest(command=cmd), self.assertRaises(PermissionError):
+                enforce_read_only_policy(call("call_kubectl", command=cmd))
+
+    def test_call_kubectl_shell_injection_and_unauthorized_commands(self):
+        attack_commands = [
+            "kubectl logs task-manager -n default; rm -rf /",
+            "kubectl logs task-manager -n default | grep secret",
+            "kubectl logs task-manager -n default $(whoami)",
+            "kubectl logs task-manager -n default & background",
+            "kubectl logs task-manager -n default\nkubectl get secrets",
+            "kubectl exec task-manager -n default -- sh",
+            "kubectl get pods -n default",
+            "kubectl delete pod task-manager -n default",
+            "kubectl logs task-manager -n default -f",
+            "kubectl logs task-manager -n default --follow",
+        ]
+        for cmd in attack_commands:
+            with self.subTest(command=cmd), self.assertRaises(PermissionError):
+                enforce_read_only_policy(call("call_kubectl", command=cmd))

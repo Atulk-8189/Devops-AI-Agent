@@ -31,6 +31,7 @@ AKS_READ_ONLY_POLICY = {
 TOOL_SERVERS = {
     **{name: "azure-devops" for name in READ_ONLY_POLICY},
     **{name: "aks" for name in AKS_READ_ONLY_POLICY},
+    "call_kubectl": "aks-kubectl",
 }
 ALLOWED_TOOL_NAMES = frozenset(TOOL_SERVERS)
 ALLOWED_PROJECT = "My Project"
@@ -119,6 +120,90 @@ def _validate_aks_arguments(args):
         raise PermissionError("Tool call blocked by read-only policy")
 
 
+def _validate_call_kubectl_command(command_str):
+    """Allow only read-only kubectl logs commands in the default namespace."""
+    if not isinstance(command_str, str) or any(char in command_str for char in SHELL_METACHARACTERS):
+        raise PermissionError("Tool call blocked by read-only policy")
+    try:
+        tokens = shlex.split(command_str, posix=True)
+    except ValueError as exc:
+        raise PermissionError("Tool call blocked by read-only policy") from exc
+
+    if len(tokens) < 2 or tokens[0] != "kubectl" or tokens[1] != "logs":
+        raise PermissionError("Tool call blocked by read-only policy")
+
+    namespace = None
+    pod_name = None
+    container_name = None
+    previous = False
+    tail = None
+
+    index = 2
+    while index < len(tokens):
+        token = tokens[index]
+        if token in FORBIDDEN_KUBECTL_TOKENS:
+            raise PermissionError("Tool call blocked by read-only policy")
+        if token in {"-n", "--namespace"}:
+            index += 1
+            if index == len(tokens) or namespace is not None:
+                raise PermissionError("Tool call blocked by read-only policy")
+            namespace = tokens[index]
+        elif token.startswith("--namespace="):
+            if namespace is not None:
+                raise PermissionError("Tool call blocked by read-only policy")
+            namespace = token.removeprefix("--namespace=")
+        elif token in {"--all-namespaces", "-A"}:
+            raise PermissionError("Tool call blocked by read-only policy")
+        elif token in {"-c", "--container"}:
+            index += 1
+            if index == len(tokens) or container_name is not None:
+                raise PermissionError("Tool call blocked by read-only policy")
+            container_name = tokens[index]
+            if not SAFE_KUBERNETES_NAME.fullmatch(container_name):
+                raise PermissionError("Tool call blocked by read-only policy")
+        elif token.startswith("--container="):
+            if container_name is not None:
+                raise PermissionError("Tool call blocked by read-only policy")
+            container_name = token.removeprefix("--container=")
+            if not SAFE_KUBERNETES_NAME.fullmatch(container_name):
+                raise PermissionError("Tool call blocked by read-only policy")
+        elif token == "--previous":
+            if previous:
+                raise PermissionError("Tool call blocked by read-only policy")
+            previous = True
+        elif token == "--tail":
+            index += 1
+            if index == len(tokens) or tail is not None:
+                raise PermissionError("Tool call blocked by read-only policy")
+            try:
+                tail = int(tokens[index])
+            except ValueError:
+                raise PermissionError("Tool call blocked by read-only policy")
+            if tail < 1 or tail > 1000:
+                raise PermissionError("Tool call blocked by read-only policy")
+        elif token.startswith("--tail="):
+            if tail is not None:
+                raise PermissionError("Tool call blocked by read-only policy")
+            try:
+                tail = int(token.removeprefix("--tail="))
+            except ValueError:
+                raise PermissionError("Tool call blocked by read-only policy")
+            if tail < 1 or tail > 1000:
+                raise PermissionError("Tool call blocked by read-only policy")
+        elif token.startswith("-"):
+            raise PermissionError("Tool call blocked by read-only policy")
+        else:
+            if pod_name is not None or not SAFE_KUBERNETES_NAME.fullmatch(token):
+                raise PermissionError("Tool call blocked by read-only policy")
+            pod_name = token
+        index += 1
+
+    if pod_name is None:
+        raise PermissionError("Tool call blocked by read-only policy")
+    if namespace != ALLOWED_NAMESPACE:
+        raise PermissionError("Tool call blocked by read-only policy")
+
+
 @observed_policy
 def enforce_read_only_policy(call):
     name = call["name"]
@@ -126,6 +211,12 @@ def enforce_read_only_policy(call):
     server = TOOL_SERVERS.get(name)
     if server is None:
         raise PermissionError("Tool call blocked by read-only policy")
+    if server == "aks-kubectl" or (server == "aks" and name == "call_kubectl"):
+        command = args.get("command") if isinstance(args, dict) else None
+        if not isinstance(command, str):
+            raise PermissionError("Tool call blocked by read-only policy")
+        _validate_call_kubectl_command(command)
+        return
     if server == "aks":
         if args.get("operation") not in AKS_READ_ONLY_POLICY[name]:
             raise PermissionError("Tool call blocked by read-only policy")

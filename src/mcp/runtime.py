@@ -46,6 +46,12 @@ def mcp_connections(settings: Settings | None = None):
                      "--allow-namespaces", "default"],
             "env": {"USE_LEGACY_TOOLS": "true"},
         },
+        "aks-kubectl": {
+            "transport": "stdio",
+            "command": settings.aks_mcp_path,
+            "args": ["--access-level", "readonly", "--enabled-components", "kubectl",
+                     "--allow-namespaces", "default"],
+        },
     }
     azure_config_dir = getattr(settings, "azure_config_dir", None)
     if azure_config_dir:
@@ -93,10 +99,13 @@ class MCPRuntime:
             self.state = "initializing"
             self.log("MCP runtime initializing")
             try:
-                for server_name, label in (
+                servers = [
                     ("azure-devops", "Azure DevOps MCP ready"),
                     ("aks", "AKS MCP ready"),
-                ):
+                ]
+                if getattr(self.client, "connections", None) and "aks-kubectl" in self.client.connections:
+                    servers.append(("aks-kubectl", "AKS Kubectl MCP ready"))
+                for server_name, label in servers:
                     try:
                         session = await self._exit_stack.enter_async_context(
                             self.client.session(server_name)

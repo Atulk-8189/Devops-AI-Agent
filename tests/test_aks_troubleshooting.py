@@ -16,6 +16,7 @@ from src.agent.aks_troubleshooting import (
     evaluate_pods,
     evaluate_service_endpoints,
     normalize_kubernetes_response,
+    read_container_logs,
 )
 from src.policy.policy import enforce_read_only_policy
 from src.agent.aks_network import network_evidence, service_details
@@ -1269,5 +1270,201 @@ class AKSClusterHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Node health is checked cluster-wide", AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY)
         self.assertIn("authorized 'default' namespace", AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY)
         self.assertIn("system and other namespaces were not inspected", AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY)
+
+
+class FakeCallKubectlTool:
+    name = "call_kubectl"
+
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.calls = []
+
+    async def ainvoke(self, call):
+        self.calls.append(call)
+        cmd = call["args"]["command"]
+        resp = self.responses.get(cmd)
+        if resp is None:
+            for pattern, r in self.responses.items():
+                if pattern in cmd:
+                    resp = r
+                    break
+        if resp is None:
+            resp = ToolMessage(content="server started\nlistening on 8080\n", tool_call_id=call["id"], name=self.name, status="success")
+        elif isinstance(resp, str):
+            resp = ToolMessage(content=resp, tool_call_id=call["id"], name=self.name, status="success")
+        return resp
+
+
+class AKSContainerLogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_read_container_logs_current(self):
+        fake_tool = FakeCallKubectlTool({
+            "kubectl logs task-manager-6b5958cd6b-bqztx -n default -c task-manager --tail=50": (
+                "2026-09-25 10:00:00 INFO Initializing service\n2026-09-25 10:00:01 INFO Ready for requests\n"
+            )
+        })
+        result = await read_container_logs([fake_tool], "task-manager-6b5958cd6b-bqztx", "task-manager", tail=50)
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["log_type"], "current")
+        self.assertEqual(result["tail"], 50)
+        self.assertEqual(result["lines"], [
+            "2026-09-25 10:00:00 INFO Initializing service",
+            "2026-09-25 10:00:01 INFO Ready for requests",
+        ])
+        self.assertEqual(len(fake_tool.calls), 1)
+        self.assertIn("kubectl logs task-manager-6b5958cd6b-bqztx -n default -c task-manager --tail=50", fake_tool.calls[0]["args"]["command"])
+
+    async def test_read_container_logs_previous(self):
+        fake_tool = FakeCallKubectlTool({
+            "--previous": "FATAL: OutOfMemoryError in worker thread\nProcess terminated with signal 9\n"
+        })
+        result = await read_container_logs([fake_tool], "task-manager-6b5958cd6b-bqztx", "task-manager", previous=True, tail=100)
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["log_type"], "previous")
+        self.assertEqual(result["tail"], 100)
+        self.assertEqual(result["lines"], [
+            "FATAL: OutOfMemoryError in worker thread",
+            "Process terminated with signal 9",
+        ])
+        self.assertIn("--previous", fake_tool.calls[0]["args"]["command"])
+
+    async def test_read_container_logs_multi_container_selection(self):
+        fake_tool = FakeCallKubectlTool({
+            "-c sidecar": "Sidecar proxy initialized\n"
+        })
+        result = await read_container_logs([fake_tool], "task-manager-pod", container_name="sidecar", tail=20)
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["container"], "sidecar")
+        self.assertEqual(result["lines"], ["Sidecar proxy initialized"])
+        self.assertIn("-c sidecar", fake_tool.calls[0]["args"]["command"])
+
+    async def test_read_container_logs_missing_previous_gracefully_handled(self):
+        fake_tool = FakeCallKubectlTool({
+            "--previous": ToolMessage(
+                content='Error from server (BadRequest): previous terminated container "task-manager" in pod "task-manager-pod" not found\n',
+                status="error",
+                tool_call_id="call-1",
+                name="call_kubectl",
+            )
+        })
+        result = await read_container_logs([fake_tool], "task-manager-pod", "task-manager", previous=True)
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["lines"], [])
+        self.assertIn("No previous terminated container found", result["message"])
+
+    async def test_read_container_logs_unavailable_container_or_pod(self):
+        fake_tool = FakeCallKubectlTool({
+            "task-manager-bad": ToolMessage(
+                content='Error from server (NotFound): pods "task-manager-bad" not found\n',
+                status="error",
+                tool_call_id="call-2",
+                name="call_kubectl",
+            )
+        })
+        result = await read_container_logs([fake_tool], "task-manager-bad", "task-manager")
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["lines"], [])
+        self.assertIn("not found", result["message"].lower())
+
+    async def test_read_container_logs_empty(self):
+        fake_tool = FakeCallKubectlTool({
+            "task-manager-pod": ToolMessage(content="   \n\n  ", status="success", tool_call_id="call-3", name="call_kubectl")
+        })
+        result = await read_container_logs([fake_tool], "task-manager-pod", "task-manager")
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["lines"], [])
+        self.assertIn("empty", result["message"].lower())
+
+    async def test_read_container_logs_input_validation(self):
+        fake_tool = FakeCallKubectlTool()
+        with self.assertRaises(ValueError):
+            await read_container_logs([fake_tool], "../escape-pod", "task-manager")
+        with self.assertRaises(ValueError):
+            await read_container_logs([fake_tool], "valid-pod", container_name=";malicious")
+        with self.assertRaises(ValueError):
+            await read_container_logs([fake_tool], "valid-pod", tail=0)
+        with self.assertRaises(ValueError):
+            await read_container_logs([fake_tool], "valid-pod", tail=1001)
+        with self.assertRaises(PermissionError):
+            await read_container_logs([fake_tool], "valid-pod", namespace="kube-system")
+
+    async def test_workflow_collects_logs_for_unhealthy_or_restarting_workloads(self):
+        unhealthy_pod = {
+            "metadata": {"name": "task-manager-crash", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": False,
+                    "restartCount": 4,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 0, "readyReplicas": 0},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [unhealthy_pod]},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool({
+            "--previous": "FATAL: NullPointerException at line 10\n",
+            "task-manager-crash": "Back-off 20s restarting failed container\n",
+        })
+        evidence = await collect_task_manager_evidence([res_tool, log_tool], log=lambda _: None)
+        self.assertEqual(len(evidence.container_logs), 2)
+        current_log = next(l for l in evidence.container_logs if l["log_type"] == "current")
+        prev_log = next(l for l in evidence.container_logs if l["log_type"] == "previous")
+        self.assertEqual(current_log["status"], "available")
+        self.assertEqual(prev_log["status"], "available")
+        self.assertEqual(prev_log["lines"], ["FATAL: NullPointerException at line 10"])
+
+        # Check evidence report inclusion
+        report = json.loads(evidence.model_input())
+        self.assertIn("container_logs", report)
+        self.assertEqual(len(report["container_logs"]), 2)
+
+    async def test_workflow_skips_logs_for_healthy_workloads(self):
+        healthy_pod = {
+            "metadata": {"name": "task-manager-healthy", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [healthy_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool()
+        evidence = await collect_task_manager_evidence([res_tool, log_tool], log=lambda _: None)
+        self.assertEqual(len(log_tool.calls), 0)
+        self.assertEqual(evidence.container_logs, [])
+        report = json.loads(evidence.model_input())
+        self.assertEqual(report["container_logs"], [])
+
 
 

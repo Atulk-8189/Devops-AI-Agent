@@ -105,12 +105,15 @@ class MCPRuntimeTests(unittest.IsolatedAsyncioTestCase):
             connections = mcp_connections(configured)
         self.assertEqual(connections["azure-devops"]["env"], {"AZURE_CONFIG_DIR": configured.azure_config_dir})
         self.assertEqual(connections["aks"]["env"], {"USE_LEGACY_TOOLS": "true", "AZURE_CONFIG_DIR": configured.azure_config_dir})
+        self.assertEqual(connections["aks-kubectl"]["env"], {"AZURE_CONFIG_DIR": configured.azure_config_dir})
         # All original server commands, arguments, transports and settings stay identical.
         del connections["azure-devops"]["env"]
         del connections["aks"]["env"]["AZURE_CONFIG_DIR"]
+        del connections["aks-kubectl"]["env"]
         self.assertEqual(connections, baseline)
         self.assertNotIn("env", baseline["azure-devops"])
         self.assertEqual(baseline["aks"]["env"], {"USE_LEGACY_TOOLS": "true"})
+        self.assertNotIn("env", baseline["aks-kubectl"])
 
     def test_unconfigured_settings_do_not_inherit_directory_from_parent(self):
         for directory in (None, ""):
@@ -118,6 +121,7 @@ class MCPRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 connections = mcp_connections(Settings("https://example.test", "test-key", "/opt/aks-mcp", azure_config_dir=directory))
             self.assertNotIn("env", connections["azure-devops"])
             self.assertEqual(connections["aks"]["env"], {"USE_LEGACY_TOOLS": "true"})
+            self.assertNotIn("env", connections["aks-kubectl"])
 
     async def test_runtime_passes_configured_directory_to_client_and_preserves_lifecycle(self):
         settings = load_settings({"AZURE_OPENAI_ENDPOINT": "https://example.test", "AZURE_OPENAI_API_KEY": "test-key",
