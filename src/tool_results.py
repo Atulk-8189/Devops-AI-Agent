@@ -40,7 +40,7 @@ def _tool_content_type(content):
     return normalized, "text"
 
 
-def normalize_successful_tool_result(message: ToolMessage):
+def normalize_successful_tool_result(message: ToolMessage, max_chars: int = MAX_TOOL_RESULT_CHARS):
     """Return a bounded, explicit envelope for untrusted successful tool output."""
     try:
         content, content_type = _tool_content_type(message.content)
@@ -49,14 +49,14 @@ def normalize_successful_tool_result(message: ToolMessage):
         return {"tool_name": message.name or "unknown", "status": "unknown",
                 "untrusted_data": True, "content_type": "unknown", "content": None,
                 "truncated": True, "truncation_notice": "Tool content could not be safely normalized; evidence is incomplete."}
-    truncated = len(serialized) > MAX_TOOL_RESULT_CHARS
+    truncated = len(serialized) > max_chars
     if truncated:
         if isinstance(content, str):
-            bounded_content = content[:MAX_TOOL_RESULT_CHARS]
+            bounded_content = content[:max_chars]
         else:
             bounded_content = {
                 "original_content_type": content_type,
-                "truncated_preview": serialized[:MAX_TOOL_RESULT_CHARS],
+                "truncated_preview": serialized[:max_chars],
             }
     else:
         bounded_content = content
@@ -70,7 +70,7 @@ def normalize_successful_tool_result(message: ToolMessage):
     }
     if truncated:
         envelope["truncation_notice"] = (
-            f"Result content was limited to {MAX_TOOL_RESULT_CHARS} characters."
+            f"Result content was limited to {max_chars} characters."
         )
     return envelope
 

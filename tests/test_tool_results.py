@@ -49,6 +49,18 @@ class ToolResultTests(unittest.TestCase):
             "content_type": "unknown", "content": None, "truncated": True,
             "truncation_notice": "Tool content could not be safely normalized; evidence is incomplete."})
 
+    def test_custom_max_chars(self):
+        value = "x" * 20000
+        unbounded = normalize_successful_tool_result(
+            ToolMessage(content=value, name="repo_file", tool_call_id="one"), max_chars=30000)
+        self.assertFalse(unbounded["truncated"])
+        self.assertEqual(unbounded["content"], value)
+        bounded = normalize_successful_tool_result(
+            ToolMessage(content=value, name="repo_file", tool_call_id="one"), max_chars=10000)
+        self.assertTrue(bounded["truncated"])
+        self.assertEqual(len(bounded["content"]), 10000)
+        self.assertIn("10000", bounded["truncation_notice"])
+
     def test_budget_can_normalize_without_importing_workflow_or_entrypoint(self):
         # A fresh interpreter avoids cached modules concealing a reverse dependency.
         code = '''

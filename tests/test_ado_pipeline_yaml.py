@@ -11,6 +11,7 @@ from mcp.types import CallToolResult, Tool
 import test_openai_flow as fixtures
 from src.agent.orchestration import RequestServices, orchestrate_request
 from src.agent.workflows import route_question
+from src.agent.ado_pipeline_yaml import pipeline_yaml_request
 
 
 class PipelineYAMLTests(unittest.IsolatedAsyncioTestCase):
@@ -21,7 +22,7 @@ class PipelineYAMLTests(unittest.IsolatedAsyncioTestCase):
         "process": {"yamlFilename": "pipelines/bootstrap.yml"}}
     repositories = [{"name": "application", "id": "verified-id"}]
 
-    async def run_request(self, results, question=None):
+    async def run_request(self, results, question=None, answer=None):
         session = SimpleNamespace(call_tool=AsyncMock(side_effect=[
             result if isinstance(result, CallToolResult) else CallToolResult(
                 content=[{"type": "text", "text": result if isinstance(result, str) else json.dumps(result)}])
@@ -31,7 +32,8 @@ class PipelineYAMLTests(unittest.IsolatedAsyncioTestCase):
                    "repo_file": fixtures.RepositoryFileReadTests.schema}
         runtime = fixtures.FakeRuntime([convert_mcp_tool_to_langchain_tool(
             session, Tool(name=name, inputSchema=schema)) for name, schema in schemas.items()])
-        client = fixtures.FakeOpenAIClient([fixtures.completion("YAML evidence inspected from main.")])
+        model_answer = answer if answer is not None else "YAML evidence inspected from main."
+        client = fixtures.FakeOpenAIClient([fixtures.completion(model_answer)])
         services = RequestServices(load_environment=Mock(),
             load_settings=Mock(return_value=fixtures.GENERIC_SETTINGS),
             client_factory=Mock(return_value=client), runtime_factory=Mock(return_value=runtime))
@@ -109,16 +111,122 @@ class PipelineYAMLTests(unittest.IsolatedAsyncioTestCase):
         client.create.assert_not_awaited()
 
     async def test_final_evidence_bounded_and_untrusted(self):
-        _, _, client = await self.run_request([[self.pipeline], self.repositories, "x" * 50000])
+        _, _, client = await self.run_request([[self.pipeline], self.repositories, "x" * 70000])
         data = json.loads(client.create.await_args.kwargs["messages"][-1]["content"])
         self.assertTrue(data["evidence"][-1]["truncated"])
         self.assertTrue(all(item["untrusted_data"] for item in data["evidence"]))
-        self.assertLess(len(json.dumps(data)), 12000)
+        self.assertLess(len(json.dumps(data)), 75000)
+
+    async def test_sufficient_yaml_evidence_within_request_budget(self):
+        content = "steps:\n- script: echo build\n" + "# padding\n" * 2500
+        result, _, client = await self.run_request([[self.pipeline], self.repositories, content])
+        data = json.loads(client.create.await_args.kwargs["messages"][-1]["content"])
+        self.assertFalse(data["evidence"][-1]["truncated"])
+        self.assertFalse(data["yaml_truncated"])
+        self.assertNotIn("truncation_warning", data)
+        self.assertEqual(data["evidence"][-1]["content"][0]["text"], content)
+        self.assertIn("main", result.answer)
+
+    async def test_truncated_evidence_identifies_unverified_operations(self):
+        result, _, client = await self.run_request(
+            [[self.pipeline], self.repositories, "steps:\n- script: echo build\n" + "#" * 70000],
+            answer="The pipeline contains an initial build step running echo build.",
+        )
+        data = json.loads(client.create.await_args.kwargs["messages"][-1]["content"])
+        self.assertTrue(data["yaml_truncated"])
+        self.assertIn("truncation_warning", data)
+        self.assertIn("truncated", result.answer.lower())
+        self.assertIn("could not be verified", result.answer.lower())
+        self.assertIn("SQL operations", result.answer)
+
+    async def test_truncated_evidence_model_identifies_unverified_operations(self):
+        answer = ("Observed behavior: Build step running echo build. "
+                  "Truncated evidence notice: Evidence was truncated; later stages and SQL operations "
+                  "could not be verified.")
+        result, _, client = await self.run_request(
+            [[self.pipeline], self.repositories, "steps:\n- script: echo build\n" + "#" * 70000],
+            answer=answer,
+        )
+        self.assertEqual(result.answer, answer)
+
+    async def test_unsupported_claims_unobserved_sql_rejected(self):
+        unsupported_answer = "Confirmed: The pipeline executes SQL operations to initialize the database."
+        result, _, _ = await self.run_request(
+            [[self.pipeline], self.repositories, "steps:\n- script: echo build"],
+            answer=unsupported_answer,
+        )
+        self.assertIn("Investigation incomplete", result.answer)
+        self.assertIn("unobserved SQL operations", result.answer)
+        self.assertIn("No missing evidence was inferred", result.answer)
+
+    async def test_unsupported_claims_unobserved_resource_changes_rejected(self):
+        unsupported_answer = "The pipeline is confirmed to perform infrastructure changes and provision resources."
+        result, _, _ = await self.run_request(
+            [[self.pipeline], self.repositories, "steps:\n- script: echo build"],
+            answer=unsupported_answer,
+        )
+        self.assertIn("Investigation incomplete", result.answer)
+        self.assertIn("unobserved resource changes", result.answer)
+        self.assertIn("No missing evidence was inferred", result.answer)
+
+    async def test_distinguish_verified_behavior_from_inference_accepted(self):
+        grounded_answer = (
+            "Verified YAML behavior: The pipeline runs a build script echo build on the main branch.\n"
+            "Inferences: Database operations and infrastructure changes were not observed in the YAML evidence "
+            "and could not be verified."
+        )
+        result, _, _ = await self.run_request(
+            [[self.pipeline], self.repositories, "steps:\n- script: echo build"],
+            answer=grounded_answer,
+        )
+        self.assertEqual(result.answer, grounded_answer)
+
+    async def test_grounding_system_prompt_rules(self):
+        _, _, client = await self.run_request([[self.pipeline], self.repositories, "steps:\n- script: echo build"])
+        messages = client.create.await_args.kwargs["messages"]
+        system_content = messages[0]["content"]
+        self.assertIn("distinguish verified yaml behavior from inference", system_content.lower())
+        self.assertIn("never describe unobserved pipeline stages, sql operations, or resource changes as confirmed facts", system_content.lower())
+        self.assertIn("if evidence is truncated, explicitly identify what could not be verified", system_content.lower())
 
     def test_narrow_route_preserves_generic_requests(self):
         self.assertEqual(route_question(self.question), "azure_devops")
         self.assertEqual(route_question("List pipelines"), "generic")
         self.assertEqual(route_question("Find Task Manager's pipeline and show its YAML."), "generic")
+
+    async def test_live_investigation_request_uses_deterministic_workflow(self):
+        question = ("Investigate the Task Manager - DB Bootstrap pipeline in my Azure DevOps project. "
+                    "Find its YAML file and summarize what it does, including its main stages "
+                    "and any infrastructure changes it is configured to perform.")
+        self.assertEqual(route_question(question), "azure_devops")
+        self.assertEqual(pipeline_yaml_request(question), (self.pipeline["name"], "My Project"))
+        _, execute, client = await self.run_request(
+            [[self.pipeline], self.repositories, "trigger: none"], question)
+        self.assertEqual([call.args[0] for call in execute.await_args_list],
+                         ["pipelines_definition", "repo_repository", "repo_file"])
+        self.assertEqual(execute.await_args_list[0].args[1]["name"], self.pipeline["name"])
+        client.create.assert_awaited_once()
+
+    def test_quoted_investigation_preserves_exact_name_and_project(self):
+        question = ('Investigate the "Task Manager - DB Bootstrap" pipeline in project "Other Project". '
+                    'Find its YAML file and summarize what it does.')
+        self.assertEqual(pipeline_yaml_request(question), (self.pipeline["name"], "Other Project"))
+        self.assertEqual(route_question(question), "azure_devops")
+
+    def test_investigation_false_positives_remain_generic(self):
+        base = ("Investigate the Task Manager - DB Bootstrap pipeline in my Azure DevOps project. "
+                "Find its YAML file and summarize what it does")
+        for question in (
+            "Investigate the Task Manager - DB Bootstrap pipeline runs and logs.",
+            "List all pipelines and their YAML files.",
+            "Investigate the My Project repository and summarize its README.",
+            base + " from the develop branch.",
+            base + ". Then run the pipeline.",
+            base.replace("Task Manager - DB Bootstrap", "any"),
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(pipeline_yaml_request(question))
+                self.assertEqual(route_question(question), "generic")
 
     async def test_project_policy_still_blocks_before_dispatch(self):
         with self.assertRaises(PermissionError):
