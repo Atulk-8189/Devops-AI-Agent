@@ -712,13 +712,19 @@ def is_task_manager_troubleshooting_question(question: str) -> bool:
     normalized = question.lower().replace("-", " ")
     if "task manager" not in normalized:
         return False
+    # Source/configuration investigations stay with their existing routes, even
+    # when they mention the Kubernetes workload they deploy. Mixed intent is
+    # deliberately left to the generic route rather than guessed here.
+    if re.search(r"\b(?:repositories|repository|repo|pipelines?|terraform)\b", normalized):
+        return False
     existing_intent = any(phrase in normalized for phrase in (
         "not working", "why", "troubleshoot", "troubleshooting", "diagnose", "diagnosis",
     ))
     # Health checks must name both this workload and a Kubernetes context.
     health_check = (
-        re.search(r"\b(?:aks|cluster|kubernetes|deployments?|pods?)\b", normalized)
-        and re.search(r"\b(?:check|inspect|health|healthy|unhealthy|readiness|status)\b", normalized)
+        re.search(r"\b(?:aks|cluster|kubernetes|deployments?|pods?|services?|workloads?)\b", normalized)
+        and re.search(r"\b(?:check|inspect|health|healthy|unhealthy|readiness|status|"
+                      r"investigate|investigation|availability|connectivity|problems?|evidence)\b", normalized)
     )
     return existing_intent or bool(health_check)
 
