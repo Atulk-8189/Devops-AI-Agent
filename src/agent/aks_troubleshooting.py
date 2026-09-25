@@ -820,14 +820,26 @@ def _evaluate_nodes(payload: Any, parser_metadata: dict[str, Any] | None = None)
             None,
         )
         ready = ready_condition == "True"
+        active_pressure = [
+            c["type"] for c in conditions
+            if isinstance(c, dict) and c.get("type") in {"MemoryPressure", "DiskPressure", "PIDPressure"}
+            and c.get("status") == "True"
+        ]
+        no_pressure = [
+            c["type"] for c in conditions
+            if isinstance(c, dict) and c.get("type") in {"MemoryPressure", "DiskPressure", "PIDPressure"}
+            and c.get("status") == "False"
+        ]
         item = {
             "name": _redact_text(name),
             "ready": ready,
             "ready_condition": ready_condition,
+            "active_pressure": active_pressure,
+            "no_pressure": no_pressure,
             "conditions": _conditions(conditions),
         }
         nodes.append(item)
-        if not ready:
+        if not ready or active_pressure:
             unhealthy.append(item)
     state = "healthy" if not unhealthy else "unhealthy"
     return {"state": state, "node_count": len(nodes), "nodes": nodes, "unhealthy_nodes": unhealthy}
