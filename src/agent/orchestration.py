@@ -31,6 +31,8 @@ class RequestServices:
     collect_task_manager_evidence: Callable = workflows.collect_task_manager_evidence
     diagnose_aks: Callable = workflows.diagnose_aks
     gather_terraform_evidence: Callable = workflows.gather_terraform_evidence
+    handle_aks_remediation: Callable = workflows.handle_aks_remediation
+    branch_remediation_executor: Callable | None = None
 
 
 @observed_request(return_outcome=True)
@@ -68,6 +70,7 @@ async def orchestrate_request(question, *, task_context=None, context_enabled=Fa
         from src.agent.ado_pipeline_yaml import handle_pipeline_yaml
         handler = {"generic": workflows.handle_generic, "aks": workflows.handle_aks,
                    "aks_cluster_health": workflows.handle_aks_cluster_health,
+                   "aks_remediation": getattr(services, "handle_aks_remediation", workflows.handle_aks_remediation),
                    "azure_devops": handle_pipeline_yaml,
                    "terraform": workflows.handle_terraform}[route]
         return await handler(client, runtime.tools, question, hints=hints,

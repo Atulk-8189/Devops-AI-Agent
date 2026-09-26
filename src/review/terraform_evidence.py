@@ -111,6 +111,10 @@ async def gather_terraform_evidence(tools, log=print):
         for item in listing["items"]:
             if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                 raise ValueError("Invalid Terraform directory entry")
+            commit_id = item.get("commitId")
+            if isinstance(commit_id, str) and "commit_sha" not in messages.discovery:
+                messages.discovery["commit_sha"] = commit_id
+                messages.discovery["commit_id"] = commit_id
             if "isFolder" in item and type(item["isFolder"]) is not bool:
                 raise ValueError("Invalid Terraform directory entry type")
             path = posixpath.normpath("/" + item["path"].lstrip("/"))

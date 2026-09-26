@@ -23,6 +23,16 @@ from src.agent.aks_troubleshooting import (
     is_task_manager_troubleshooting_question,
     is_aks_cluster_health_question,
 )
+from src.agent.remediation_discovery import (
+    is_aks_remediation_question,
+    correlate_aks_to_terraform,
+    RemediationDiscoveryResult,
+)
+from src.agent.remediation_proposal import (
+    generate_remediation_proposal,
+    determine_proposed_replacement,
+    RemediationProposalResult,
+)
 from src.mcp.runtime import MCPRuntimeError
 from src.agent.repository_discovery import RepositoryDiscovery
 from src.config import ConfigurationError
@@ -247,6 +257,8 @@ def route_question(question):
     from src.agent.ado_pipeline_yaml import pipeline_yaml_request
     if pipeline_yaml_request(question):
         return "azure_devops"
+    if is_aks_remediation_question(question):
+        return "aks_remediation"
     if is_task_manager_troubleshooting_question(question):
         return "aks"
     if is_aks_cluster_health_question(question):
@@ -338,6 +350,108 @@ async def handle_aks(client, tools, question, *, hints, task_context, context_en
         categories = {"deployment": "deployment_health", "pods": "pod_health", "service": "service_health", "events": "events"}
         done = [categories[s.name] for s in evidence.steps if s.name in categories and s.outcome == "ok"]
         return WorkflowResult(answer, progress("aks", completed=done, unresolved=tuple(set(categories.values()) - set(done))))
+    return WorkflowResult(answer)
+
+
+async def handle_aks_remediation(client, tools, question, *, hints="", task_context=None, context_enabled=False, services=None):
+    """Correlate AKS diagnostic evidence with Azure Repos Terraform source code."""
+    collector = getattr(services, "collect_task_manager_evidence", None) if services else None
+    if collector is None:
+        collector = collect_task_manager_evidence
+    aks_diagnoser = getattr(services, "diagnose_aks", None) if services else None
+    if aks_diagnoser is None:
+        aks_diagnoser = diagnose_aks
+    tf_gatherer = getattr(services, "gather_terraform_evidence", None) if services else None
+    if tf_gatherer is None:
+        tf_gatherer = gather_terraform_evidence
+
+    emit("evidence_collection", outcome="started")
+    aks_evidence = await evidence_call(lambda: collector(tools))
+    checkpoint()
+    emit(
+        "evidence_result",
+        outcome="collected",
+        evidence_status="partial" if aks_evidence.budget_exhausted or any(step.outcome != "ok" for step in aks_evidence.steps) else "complete",
+    )
+
+    diagnosis = await aks_diagnoser(client, question, aks_evidence, **({"task_hints": hints} if hints else {}))
+    checkpoint()
+
+    emit("evidence_collection", outcome="started")
+    terraform_files = {}
+    discovery_metadata = {}
+    try:
+        terraform_messages = await evidence_call(lambda: tf_gatherer(tools))
+        checkpoint()
+        emit(
+            "evidence_result",
+            outcome="collected",
+            evidence_status="partial" if terraform_messages.discovery.get("incomplete") else "complete",
+        )
+        terraform_files = retrieved_files(terraform_messages)
+        discovery_metadata = terraform_messages.discovery
+    except Exception as error:
+        emit("evidence_result", outcome="failed", evidence_status="unavailable")
+        safe = classify_error(error)
+        if safe.category in {"authentication", "authorization"}:
+            raise
+        discovery_metadata = {"incomplete": True, "error": str(error)}
+
+    discovery_result = correlate_aks_to_terraform(
+        aks_evidence=aks_evidence,
+        diagnosis=diagnosis,
+        terraform_files=terraform_files,
+        discovery_metadata=discovery_metadata,
+    )
+    checkpoint()
+
+    # Obtain commit SHA, repository ID, and proposed replacement metadata
+    commit_sha = (
+        getattr(services, "commit_sha", None) if services else None
+    ) or discovery_metadata.get("commit_sha") or discovery_metadata.get("commit_id")
+
+    repository_id = (
+        getattr(services, "repository_id", None) if services else None
+    ) or discovery_metadata.get("repository_id")
+
+    proposed_replacement = getattr(services, "proposed_replacement_content", None) if services else None
+    rationale = getattr(services, "proposal_rationale", None) if services else None
+
+    if not proposed_replacement and discovery_result.status == "matched" and discovery_result.repository_path in terraform_files:
+        derived_replacement, derived_rationale = determine_proposed_replacement(
+            discovery_result,
+            terraform_files[discovery_result.repository_path],
+            question,
+            hints=hints,
+        )
+        if derived_replacement:
+            proposed_replacement = derived_replacement
+        if not rationale and derived_rationale:
+            rationale = derived_rationale
+
+    policy = getattr(services, "write_policy", None) if services else None
+
+    proposal_result = generate_remediation_proposal(
+        discovery_result=discovery_result,
+        proposed_replacement_content=proposed_replacement or "",
+        commit_sha=commit_sha,
+        repository_id=repository_id,
+        reason=rationale,
+        policy=policy,
+        original_files=terraform_files,
+    )
+    checkpoint()
+
+    branch_executor = getattr(services, "branch_remediation_executor", None) if services else None
+    if branch_executor and proposal_result.status == "proposed" and proposal_result.proposal:
+        try:
+            branch_result = branch_executor(proposal_result)
+            proposal_result.branch_remediation = branch_result
+        except Exception as err:
+            emit("branch_remediation_failed", outcome="failed", error=str(err))
+        checkpoint()
+
+    answer = json.dumps(proposal_result.model_dump(mode="json"), indent=2)
     return WorkflowResult(answer)
 
 
