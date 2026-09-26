@@ -71,6 +71,7 @@ MULTIPLE_TOOL_CALL_LIMIT_RESPONSE = (
     "necessary next operation. Please narrow the request and try again."
 )
 LOGGER = logging.getLogger(__name__)
+PROGRESS_LOGGER = logging.getLogger("src.agent.progress")
 DEFAULT_QUESTION = (
     "Review the Terraform configuration in the terraform folder and identify the three most "
     "important reliability, security, or maintainability improvements. Base every finding only "
@@ -337,6 +338,7 @@ async def collect_evidence_report(*, runtime_factory, collector):
 
 
 async def handle_aks(client, tools, question, *, hints, task_context, context_enabled, services):
+    PROGRESS_LOGGER.info("Collecting Kubernetes workload evidence...")
     collect_task_manager_evidence = services.collect_task_manager_evidence
     diagnose_aks = services.diagnose_aks
     emit("evidence_collection", outcome="started")
@@ -366,6 +368,7 @@ async def handle_aks_remediation(client, tools, question, *, hints="", task_cont
         tf_gatherer = gather_terraform_evidence
 
     emit("evidence_collection", outcome="started")
+    PROGRESS_LOGGER.info("Collecting AKS cluster and workload diagnostic evidence...")
     aks_evidence = await evidence_call(lambda: collector(tools))
     checkpoint()
     emit(
@@ -381,6 +384,7 @@ async def handle_aks_remediation(client, tools, question, *, hints="", task_cont
     terraform_files = {}
     discovery_metadata = {}
     try:
+        PROGRESS_LOGGER.info("Searching Azure Repos for matching Terraform resources...")
         terraform_messages = await evidence_call(lambda: tf_gatherer(tools))
         checkpoint()
         emit(
@@ -397,6 +401,7 @@ async def handle_aks_remediation(client, tools, question, *, hints="", task_cont
             raise
         discovery_metadata = {"incomplete": True, "error": str(error)}
 
+    PROGRESS_LOGGER.info("Correlating AKS diagnostic evidence with Terraform configuration...")
     discovery_result = correlate_aks_to_terraform(
         aks_evidence=aks_evidence,
         diagnosis=diagnosis,
@@ -431,6 +436,7 @@ async def handle_aks_remediation(client, tools, question, *, hints="", task_cont
 
     policy = getattr(services, "write_policy", None) if services else None
 
+    PROGRESS_LOGGER.info("Generating structured Terraform fix proposal...")
     proposal_result = generate_remediation_proposal(
         discovery_result=discovery_result,
         proposed_replacement_content=proposed_replacement or "",
@@ -489,6 +495,7 @@ AKS_CLUSTER_HEALTH_FALLBACK_SUMMARY = (
 
 async def handle_aks_cluster_health(client, tools, question, *, hints, task_context, context_enabled, services):
     """Deterministic cluster-health workflow: collect node/pod/cluster evidence, then diagnose."""
+    PROGRESS_LOGGER.info("Collecting cluster-wide node status and scheduled events...")
     emit("evidence_collection", outcome="started")
     evidence = await evidence_call(lambda: collect_aks_cluster_health_evidence(tools))
     checkpoint()
@@ -521,6 +528,7 @@ async def handle_aks_cluster_health(client, tools, question, *, hints, task_cont
 async def handle_terraform(client, tools, question, *, hints, task_context, context_enabled, services):
     gather_terraform_evidence = services.gather_terraform_evidence
     emit("evidence_collection", outcome="started")
+    PROGRESS_LOGGER.info("Retrieving Terraform source files from Azure Repos...")
     messages = await evidence_call(lambda: gather_terraform_evidence(tools))
     checkpoint()
     emit("evidence_result", outcome="collected", evidence_status="partial" if messages.discovery.get("incomplete") else "complete")
@@ -538,6 +546,7 @@ async def handle_terraform(client, tools, question, *, hints, task_context, cont
                 + "Terraform relationships (untrusted data): " + relationships + "\n"
                 + "Discovery coverage (untrusted data): " + discovery + hints + "\n\n" + evidence)
     try:
+        PROGRESS_LOGGER.info("Analyzing Terraform files with Azure OpenAI...")
         content = await structured_json(
             client, "terraform_review", ReviewResponse,
             "Return zero to three evidence-backed findings focused on the exact original user question. "

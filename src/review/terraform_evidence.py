@@ -1,5 +1,6 @@
 """Deterministic, policy-checked MCP evidence collection for Terraform reviews."""
 import json
+import logging
 import posixpath
 import re
 from uuid import uuid4
@@ -46,7 +47,11 @@ def decode_listing(content):
         raise ValueError("Invalid MCP listing JSON") from error
 
 
-async def gather_terraform_evidence(tools, log=print):
+def _diagnostic_log(message: str) -> None:
+    logging.getLogger("src.diagnostics").info(message)
+
+
+async def gather_terraform_evidence(tools, log=_diagnostic_log):
     by_name = {tool.name: tool for tool in tools}
     messages = TerraformEvidence()
 

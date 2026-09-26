@@ -43,14 +43,105 @@ from src.agent.workflows import (
     DEFAULT_QUESTION,
 )
 
+import sys
+
 LOGGER = logging.getLogger(__name__)
+PROGRESS_LOGGER = logging.getLogger("src.agent.progress")
+
+
+class TerminalProgressFilter(logging.Filter):
+    """Filter records for terminal stderr output.
+
+    In normal mode:
+      - Allows WARNING, ERROR, CRITICAL records.
+      - Allows concise progress messages from 'src.agent.progress'.
+      - Suppresses low-level INFO logs from observability JSON, httpx, and internal modules.
+    In verbose mode:
+      - Allows all records (INFO and above).
+    """
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+        self.verbose = verbose
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self.verbose:
+            return True
+        if record.name == "mcp.os.posix.utilities" and "Process group termination failed" in record.getMessage():
+            return False
+        if record.levelno >= logging.WARNING:
+            return True
+        if record.name == "src.agent.progress":
+            return True
+        return False
+
+
+class TerminalFormatter(logging.Formatter):
+    """Formatter tailored for terminal presentation.
+
+    In normal mode:
+      - Progress messages are printed cleanly without logger name prefixes.
+      - Warnings and errors display their severity level prefix clearly.
+    In verbose mode:
+      - Standard diagnostic format: '%(levelname)s %(name)s: %(message)s'.
+    """
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+        self.verbose = verbose
+        self._verbose_fmt = logging.Formatter("%(levelname)s %(name)s: %(message)s")
+        self._progress_fmt = logging.Formatter("%(message)s")
+        self._warning_fmt = logging.Formatter("%(levelname)s: %(message)s")
+
+    def format(self, record: logging.LogRecord) -> str:
+        if self.verbose:
+            return self._verbose_fmt.format(record)
+        if record.name == "src.agent.progress":
+            return self._progress_fmt.format(record)
+        if record.levelno >= logging.WARNING:
+            return self._warning_fmt.format(record)
+        return self._verbose_fmt.format(record)
+
+
+def configure_logging(verbose: bool = False, stream=None) -> logging.Handler:
+    """Configure terminal logging for normal or verbose mode without globally disabling loggers."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    handler = logging.StreamHandler(stream or sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.addFilter(TerminalProgressFilter(verbose=verbose))
+    handler.setFormatter(TerminalFormatter(verbose=verbose))
+    root.addHandler(handler)
+
+    noisy_loggers = ("httpx", "httpcore", "openai")
+    for name in noisy_loggers:
+        logging.getLogger(name).setLevel(logging.INFO if verbose else logging.WARNING)
+
+    logging.getLogger("src.observability").setLevel(logging.INFO)
+    return handler
+
+
+def build_cli_parser():
+    parser = argparse.ArgumentParser(description="Run one DevOps AI Agent request.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Display detailed diagnostic logs.")
+    parser.add_argument("question", nargs="*", help="Question to send to the agent.")
+    return parser
+
+
+def parse_cli_args(argv=None):
+    parser = build_cli_parser()
+    parsed = parser.parse_args(argv)
+    question = " ".join(parsed.question) if parsed.question else DEFAULT_QUESTION
+    return question, parsed.verbose
 
 
 def parse_cli_question(argv=None):
-    parser = argparse.ArgumentParser(description="Run one DevOps AI Agent request.")
-    parser.add_argument("question", nargs="*", help="Question to send to the agent.")
-    parsed = parser.parse_args(argv)
-    return " ".join(parsed.question) if parsed.question else DEFAULT_QUESTION
+    question, _ = parse_cli_args(argv)
+    return question
 
 
 async def task_manager_evidence_only():
@@ -76,10 +167,19 @@ async def main(question=DEFAULT_QUESTION, *, task_context=None, context_enabled=
     return result.progress
 
 
-def cli():
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+def cli(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    verbose = any(arg in args for arg in ("-v", "--verbose"))
+    raw_question = parse_cli_question(argv)
+    if isinstance(raw_question, tuple):
+        question, parsed_verbose = raw_question
+        verbose = verbose or parsed_verbose
+    else:
+        question = raw_question
+
+    configure_logging(verbose=verbose)
     try:
-        asyncio.run(main(question=parse_cli_question()))
+        asyncio.run(main(question=question))
     except ConfigurationError as exc:
         safe = classify_error(exc)
         LOGGER.error(diagnostic_line(event="request_failed", error_category=safe.category, reason_code=safe.reason_code))

@@ -58,8 +58,10 @@ async def orchestrate_request(question, *, task_context=None, context_enabled=Fa
         base_url=f"{settings.azure_openai_endpoint}/openai/v1/", timeout=60.0, max_retries=0)
     runtime = None
     failure = None
+    PROGRESS_LOGGER = logging.getLogger("src.agent.progress")
     try:
         LOGGER.info("agent startup: initializing Azure OpenAI and MCP runtime")
+        PROGRESS_LOGGER.info("Connecting to services and discovering tools...")
         runtime = services.runtime_factory(settings=settings)
         await runtime.initialize()
         LOGGER.info("tool discovery complete: %d allowed tools", len(runtime.tools))
@@ -67,14 +69,25 @@ async def orchestrate_request(question, *, task_context=None, context_enabled=Fa
         if route == "generic" and task_context is not None and task_context.topic in {"aks", "terraform"}:
             route = task_context.topic
         select_route(route)
+        route_descriptions = {
+            "terraform": "Reviewing Terraform configuration...",
+            "aks": "Investigating AKS workload health...",
+            "aks_cluster_health": "Investigating AKS cluster health...",
+            "aks_remediation": "Correlating AKS diagnostic evidence with Terraform in Azure Repos...",
+            "azure_devops": "Inspecting Azure DevOps pipeline configuration...",
+            "generic": "Analyzing request...",
+        }
+        PROGRESS_LOGGER.info(route_descriptions.get(route, "Processing request..."))
         from src.agent.ado_pipeline_yaml import handle_pipeline_yaml
         handler = {"generic": workflows.handle_generic, "aks": workflows.handle_aks,
                    "aks_cluster_health": workflows.handle_aks_cluster_health,
                    "aks_remediation": getattr(services, "handle_aks_remediation", workflows.handle_aks_remediation),
                    "azure_devops": handle_pipeline_yaml,
                    "terraform": workflows.handle_terraform}[route]
-        return await handler(client, runtime.tools, question, hints=hints,
-                             task_context=task_context, context_enabled=context_enabled, services=services)
+        result = await handler(client, runtime.tools, question, hints=hints,
+                               task_context=task_context, context_enabled=context_enabled, services=services)
+        PROGRESS_LOGGER.info("Investigation complete. Generating response...")
+        return result
     except BaseException as error:
         # Include cancellation: cleanup must not replace the original failure.
         failure = error

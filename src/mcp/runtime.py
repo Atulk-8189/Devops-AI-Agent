@@ -1,15 +1,81 @@
 """Persistent, policy-filtered MCP sessions for the agent process lifetime."""
 import asyncio
+import json
 import logging
 import os
+import sys
+import threading
 from pathlib import Path
 from contextlib import AsyncExitStack
 
+import mcp.client.stdio
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 from src.policy.policy import ALLOWED_TOOL_NAMES, TOOL_SERVERS
 from src.config import Settings, load_settings
+
+SUBPROCESS_LOGGER = logging.getLogger("src.mcp.subprocess")
+_ACTIVE_SUBPROCESSES: set = set()
+
+
+def _drain_stderr_worker(r_fd: int, cmd_name: str) -> None:
+    try:
+        with os.fdopen(r_fd, "r", encoding="utf-8", errors="replace") as pipe:
+            for line in pipe:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                is_error = False
+                is_warning = False
+                if line_str.startswith("{") and line_str.endswith("}"):
+                    try:
+                        data = json.loads(line_str)
+                        lvl = str(data.get("level", "")).lower()
+                        if lvl in {"error", "fatal"}:
+                            is_error = True
+                        elif lvl in {"warn", "warning"}:
+                            is_warning = True
+                    except Exception:
+                        pass
+                if not is_error and not is_warning:
+                    lower = line_str.lower()
+                    if any(kw in lower for kw in ("error:", "fatal:", "[error]", "exception:", "traceback")):
+                        is_error = True
+                    elif any(kw in lower for kw in ("warn:", "[warn]", "warning:")):
+                        is_warning = True
+
+                if is_error:
+                    SUBPROCESS_LOGGER.error("[%s] %s", cmd_name, line_str)
+                elif is_warning:
+                    SUBPROCESS_LOGGER.warning("[%s] %s", cmd_name, line_str)
+                else:
+                    SUBPROCESS_LOGGER.info("[%s] %s", cmd_name, line_str)
+    except Exception:
+        pass
+
+
+_orig_create_process = mcp.client.stdio._create_platform_compatible_process
+
+
+async def _managed_create_platform_compatible_process(command, args, env=None, errlog=sys.stderr, cwd=None):
+    if errlog is sys.stderr or errlog is None:
+        r_fd, w_fd = os.pipe()
+        try:
+            process = await _orig_create_process(command, args, env=env, errlog=w_fd, cwd=cwd)
+        finally:
+            os.close(w_fd)
+        cmd_name = Path(command).name
+        t = threading.Thread(target=_drain_stderr_worker, args=(r_fd, cmd_name), daemon=True)
+        t.start()
+    else:
+        process = await _orig_create_process(command, args, env=env, errlog=errlog, cwd=cwd)
+
+    _ACTIVE_SUBPROCESSES.add(process)
+    return process
+
+
+mcp.client.stdio._create_platform_compatible_process = _managed_create_platform_compatible_process
 
 
 class MCPRuntimeError(RuntimeError):
@@ -132,6 +198,13 @@ class MCPRuntime:
                 self.log("MCP runtime ready")
             except Exception as exc:
                 self.state = "failed"
+                for proc in list(_ACTIVE_SUBPROCESSES):
+                    if getattr(proc, "returncode", None) is None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                _ACTIVE_SUBPROCESSES.clear()
                 await self._exit_stack.aclose()
                 self.sessions = {}
                 self.tools = []
@@ -147,6 +220,13 @@ class MCPRuntime:
         async with self._lock:
             if self.state == "closed":
                 return
+            for proc in list(_ACTIVE_SUBPROCESSES):
+                if getattr(proc, "returncode", None) is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            _ACTIVE_SUBPROCESSES.clear()
             await self._exit_stack.aclose()
             self.sessions = {}
             self.tools = []

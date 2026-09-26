@@ -1,6 +1,7 @@
 """Evidence collection for read-only AKS application troubleshooting."""
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +16,10 @@ from src.mcp.runtime import MCPRuntimeError
 from src.agent.aks_network import network_evidence
 from src.safe_diagnostics import diagnostic_line, classify_error
 from src.agent.aks_events import event_evidence
+
+
+def _diagnostic_log(message: str) -> None:
+    logging.getLogger("src.diagnostics").info(message)
 
 
 NAMESPACE = "default"
@@ -615,7 +620,7 @@ async def read_container_logs(
     }
 
 
-async def collect_task_manager_evidence(tools, log=print) -> TroubleshootingEvidence:
+async def collect_task_manager_evidence(tools, log=_diagnostic_log) -> TroubleshootingEvidence:
     evidence = TroubleshootingEvidence()
     try:
         return await _collect_task_manager_evidence(tools, evidence, log)
@@ -986,7 +991,7 @@ def _evaluate_nodes(payload: Any, parser_metadata: dict[str, Any] | None = None)
     return {"state": state, "node_count": len(nodes), "nodes": nodes, "unhealthy_nodes": unhealthy}
 
 
-async def collect_aks_cluster_health_evidence(tools, log=print) -> ClusterHealthEvidence:
+async def collect_aks_cluster_health_evidence(tools, log=_diagnostic_log) -> ClusterHealthEvidence:
     """Deterministic read-only AKS cluster-health collector.
 
     Tool call sequence (max MAX_CLUSTER_HEALTH_CALLS):
@@ -1241,6 +1246,6 @@ def _task_manager_evidence_report(evidence: TroubleshootingEvidence) -> dict[str
     }
 
 
-async def collect_task_manager_evidence_report(tools, log=print) -> dict[str, Any]:
+async def collect_task_manager_evidence_report(tools, log=_diagnostic_log) -> dict[str, Any]:
     """Run the existing deterministic collector and return its focused evidence-only report."""
     return task_manager_evidence_report(await collect_task_manager_evidence(tools, log=log))
