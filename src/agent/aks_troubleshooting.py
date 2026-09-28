@@ -526,6 +526,18 @@ def evaluate_network_policies(
     return {"state": "present", "policy_count": len(policies), "policies": policies}
 
 
+def is_explicit_log_request(question: str | None) -> bool:
+    """Detect whether a question explicitly requests application or container logs.
+
+    This helper is shared across Kubernetes and workload troubleshooting workflows
+    to distinguish explicit log inspection requests from general health checks.
+    """
+    if not question or not isinstance(question, str):
+        return False
+    normalized = question.lower().replace("-", " ")
+    return bool(re.search(r"\b(?:logs?|logging)\b", normalized))
+
+
 class _CollectionBudgetReached(Exception):
     pass
 
@@ -605,7 +617,7 @@ async def read_container_logs(
         lines = []
     else:
         status = "available"
-        lines = [_redact_text(line, limit=500) for line in raw.splitlines() if line.strip()][:tail]
+        lines = [_redact_text(line, limit=500) for line in raw.splitlines() if line.strip()][-tail:]
         message = f"Collected {len(lines)} log lines."
 
     return {
@@ -620,10 +632,26 @@ async def read_container_logs(
     }
 
 
-async def collect_task_manager_evidence(tools, log=_diagnostic_log) -> TroubleshootingEvidence:
+def _log_step_outcome(status: str, previous: bool = False) -> str:
+    """Normalize container log status to EvidenceStep outcome.
+
+    'available' (logs retrieved), 'empty' (successful read with 0 lines), and
+    'not_found' (expected when previous container was already pruned) are successful
+    read outcomes ('ok'). Genuine failures ('error', 'unavailable') remain non-ok.
+    """
+    if status in {"available", "empty"}:
+        return "ok"
+    if previous and status == "not_found":
+        return "ok"
+    return status
+
+
+async def collect_task_manager_evidence(
+    tools, log=_diagnostic_log, question: str | None = None
+) -> TroubleshootingEvidence:
     evidence = TroubleshootingEvidence()
     try:
-        return await _collect_task_manager_evidence(tools, evidence, log)
+        return await _collect_task_manager_evidence(tools, evidence, log, question=question)
     except _CollectionBudgetReached:
         from src.observability import emit
         emit("execution_stopped", outcome="stopped", reason_code="budget_exhausted", remaining_budget=0)
@@ -632,7 +660,9 @@ async def collect_task_manager_evidence(tools, log=_diagnostic_log) -> Troublesh
         return evidence
 
 
-async def _collect_task_manager_evidence(tools, evidence, log) -> TroubleshootingEvidence:
+async def _collect_task_manager_evidence(
+    tools, evidence, log, question: str | None = None
+) -> TroubleshootingEvidence:
     """Collect the minimum evidence path and stop after a clear upstream failure."""
     by_name = {tool.name: tool for tool in tools}
     if "kubectl_resources" not in by_name:
@@ -760,7 +790,8 @@ async def _collect_task_manager_evidence(tools, evidence, log) -> Troubleshootin
                     or c.get("current_state", {}).get("state") in ("waiting", "terminated")
                 )
                 restarts = c.get("restart_count") or 0
-                if is_unhealthy or restarts > 0:
+                should_collect_logs = is_unhealthy or restarts > 0 or is_explicit_log_request(question)
+                if should_collect_logs:
                     if evidence.collection_calls >= MAX_AKS_COLLECTION_CALLS:
                         evidence.steps.append(EvidenceStep(
                             f"logs:{pod['name']}:{c_name}:current", "logs", "pods",
@@ -775,7 +806,8 @@ async def _collect_task_manager_evidence(tools, evidence, log) -> Troubleshootin
                     evidence.container_logs.append(current_entry)
                     evidence.steps.append(EvidenceStep(
                         f"logs:{pod['name']}:{c_name}:current", "logs", "pods",
-                        f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --tail=100", current_entry["status"],
+                        f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --tail=100",
+                        _log_step_outcome(current_entry["status"], previous=False),
                         payload=current_entry,
                     ))
 
@@ -794,7 +826,8 @@ async def _collect_task_manager_evidence(tools, evidence, log) -> Troubleshootin
                         evidence.container_logs.append(prev_entry)
                         evidence.steps.append(EvidenceStep(
                             f"logs:{pod['name']}:{c_name}:previous", "logs", "pods",
-                            f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --previous --tail=100", prev_entry["status"],
+                            f"kubectl logs {pod['name']} -n {NAMESPACE} -c {c_name} --previous --tail=100",
+                            _log_step_outcome(prev_entry["status"], previous=True),
                             payload=prev_entry,
                         ))
     await invoke("kubectl_resources", "get", "events", f"--namespace {NAMESPACE} -o json", "events")
@@ -866,12 +899,14 @@ def is_task_manager_troubleshooting_question(question: str) -> bool:
         return False
     existing_intent = any(phrase in normalized for phrase in (
         "not working", "why", "troubleshoot", "troubleshooting", "diagnose", "diagnosis",
+        "crash", "crashing", "failing", "failed", "restart", "restarting",
     ))
     # Health checks must name both this workload and a Kubernetes context.
     health_check = (
-        re.search(r"\b(?:aks|cluster|kubernetes|deployments?|pods?|services?|workloads?)\b", normalized)
+        re.search(r"\b(?:aks|cluster|kubernetes|deployments?|pods?|services?|workloads?|containers?|logs?|namespaces?)\b", normalized)
         and re.search(r"\b(?:check|inspect|health|healthy|unhealthy|readiness|status|"
-                      r"investigate|investigation|availability|connectivity|problems?|evidence)\b", normalized)
+                      r"investigate|investigation|availability|connectivity|problems?|evidence|"
+                      r"logs?|failures?|errors?|crash(?:ing)?|restart(?:ing|s)?)\b", normalized)
     )
     return existing_intent or bool(health_check)
 
@@ -1246,6 +1281,8 @@ def _task_manager_evidence_report(evidence: TroubleshootingEvidence) -> dict[str
     }
 
 
-async def collect_task_manager_evidence_report(tools, log=_diagnostic_log) -> dict[str, Any]:
+async def collect_task_manager_evidence_report(
+    tools, log=_diagnostic_log, question: str | None = None
+) -> dict[str, Any]:
     """Run the existing deterministic collector and return its focused evidence-only report."""
-    return task_manager_evidence_report(await collect_task_manager_evidence(tools, log=log))
+    return task_manager_evidence_report(await collect_task_manager_evidence(tools, log=log, question=question))

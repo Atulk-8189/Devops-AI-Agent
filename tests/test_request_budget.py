@@ -102,6 +102,40 @@ class RequestBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("useful", str(output.call_args))
         self.assertIn("incomplete", str(output.call_args))
 
+    async def test_call_kubectl_oversized_log_bounded_before_aggregate_budget(self):
+        # 5,000,000 chars exceeds the 4,000,000 aggregate limit
+        huge_log = "START_OF_MASSIVE_LOG_" + ("x" * 5_000_000) + "_CRITICAL_PANIC_AT_TAIL"
+        kubectl_call = {
+            "name": "call_kubectl",
+            "args": {"command": "kubectl logs deployment/task-manager -n default"},
+            "id": "call-k8s-1",
+        }
+        invoke = AsyncMock(return_value=ToolMessage(content=huge_log, name="call_kubectl", tool_call_id="call-k8s-1"))
+
+        @observed_request
+        async def request():
+            return await mcp_call(kubectl_call, invoke)
+
+        with patch("builtins.print"):
+            result = await request()
+
+        # Must not raise RequestBoundExceeded
+        self.assertNotIsInstance(result, BoundedResult)
+        self.assertIsInstance(result, ToolMessage)
+        # Tail must be preserved
+        self.assertTrue(result.content.endswith("_CRITICAL_PANIC_AT_TAIL"))
+        self.assertNotIn("START_OF_MASSIVE_LOG_", result.content)
+        # Clear truncation marker must be present
+        self.assertIn("[TRUNCATED: original", result.content)
+        # Additional kwargs truncation metadata must be recorded
+        truncation = result.additional_kwargs.get("truncation", {})
+        self.assertTrue(truncation.get("truncated"))
+        self.assertEqual(truncation.get("original_chars"), len(huge_log))
+        # Total charged to budget should be bounded (~256KB), far below 4,000,000
+        budget = current_budget()
+        # Budget is closed after request, check result was bounded
+        self.assertLess(len(result.content), 300_000)
+
     async def test_aggregate_input_blocks_model_and_tool(self):
         for boundary in ("model", "mcp"):
             with self.subTest(boundary=boundary):
@@ -209,13 +243,19 @@ class RequestBudgetTests(unittest.IsolatedAsyncioTestCase):
         env = {"AZURE_OPENAI_ENDPOINT": "https://example.test", "AZURE_OPENAI_API_KEY": "private", "AKS_MCP_PATH": "/tmp/aks"}
         self.assertEqual(load_settings(env).request_deadline_seconds, 300)
         self.assertEqual(load_settings({**env, "REQUEST_DEADLINE_SECONDS": "120"}).request_deadline_seconds, 120)
+        self.assertEqual(load_settings(env).kubectl_logs_max_chars, 256_000)
+        self.assertEqual(load_settings({**env, "KUBECTL_LOGS_MAX_CHARS": "500000"}).kubectl_logs_max_chars, 500_000)
         for value in ("0", "1801", "nan", "password=private"):
             with self.subTest(value=value), self.assertRaises(ConfigurationError) as caught:
                 load_settings({**env, "REQUEST_DEADLINE_SECONDS": value})
             self.assertNotIn(value, str(caught.exception))
+        for value in ("0", "999", "5000000", "nan"):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError) as caught:
+                load_settings({**env, "KUBECTL_LOGS_MAX_CHARS": value})
+            self.assertNotIn(value, str(caught.exception))
         self.assertEqual(MAX_TOOL_EXECUTIONS, 5)
         self.assertEqual(MAX_AKS_COLLECTION_CALLS, 12)
-        self.assertEqual(MAX_REQUEST_RESULT_CHARS, 512_000)
+        self.assertEqual(MAX_REQUEST_RESULT_CHARS, 4_000_000)
         self.assertEqual(MAX_REQUEST_INPUT_CHARS, 1_000_000)
 
     def test_measurement_does_not_stringify_unknown_objects(self):

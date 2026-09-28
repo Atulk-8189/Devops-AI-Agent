@@ -1,0 +1,108 @@
+/* The divider and both panes are siblings in Chainlit's actual panel group.
+   Only this trace group is overridden; nested panels and history are untouched. */
+[data-devops-trace-layout] {
+  display: flex !important;
+  min-width: 0 !important;
+  overflow: hidden !important;
+}
+[data-devops-trace-layout] > [data-devops-chat-pane] {
+  flex: 1 1 0% !important;
+  min-width: 0 !important;
+  overflow: hidden !important;
+}
+[data-devops-trace-layout] > [data-devops-trace-pane] {
+  flex: 0 0 var(--devops-panel-width, 288px) !important;
+  min-width: 0 !important;
+  overflow: hidden !important;
+}
+[data-devops-native-splitter] { display: none !important; }
+#devops-trace-splitter {
+  flex: 0 0 6px;
+  position: relative;
+  cursor: col-resize;
+  background: #334155;
+  touch-action: none;
+  user-select: none;
+}
+#devops-trace-splitter:hover,
+#devops-trace-splitter:focus-visible {
+  background: #60a5fa;
+  outline: 2px solid #60a5fa;
+  outline-offset: -2px;
+}
+#devops-trace-splitter::after {
+  content: "";
+  position: absolute;
+  top: 45%;
+  left: 2px;
+  width: 2px;
+  height: 32px;
+  border-radius: 2px;
+  background: #94a3b8;
+}
+.devops-trace-dragging, .devops-trace-dragging * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+[data-devops-trace-collapsed] > [data-devops-trace-pane] { display: none !important; }
+#devops-sidebar-rail {
+  flex: 0 0 32px;
+  align-self: stretch;
+  border-left: 1px solid #475569;
+  background: #0b0f19;
+  color: #93c5fd;
+  font-size: 24px;
+  cursor: pointer;
+}
+#devops-sidebar-rail[hidden], #devops-trace-splitter[hidden] { display: none; }
+
+/* 4. Chainlit SideView ResizablePanel & Content Styling */
+#side-view-title {
+  display: none !important; /* Hide redundant raw title; ExecutionTrace renders a rich header */
+}
+
+#side-view-content {
+  height: 100% !important;
+  max-height: 100% !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  overflow: hidden !important;
+  display: flex !important;
+  flex-direction: column !important;
+  flex-grow: 1 !important;
+}
+
+.side-custom {
+  height: 100% !important;
+  max-height: 100% !important;
+  overflow: hidden !important;
+  display: flex !important;
+  flex-direction: column !important;
+  flex-grow: 1 !important;
+  padding: 0 !important;
+}
+
+/* 5. Smooth custom scrollbars for trace panels */
+.devops-trace-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(71, 85, 105, 0.5) transparent;
+}
+.devops-trace-scroll::-webkit-scrollbar {
+  width: 5px;
+}
+.devops-trace-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.devops-trace-scroll::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.5);
+  border-radius: 4px;
+}
+.devops-trace-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.8);
+}
+
+/* 8. Execution Viewer Modal Canvas & Background Styles */
+.bg-grid-pattern {
+  background-image: radial-gradient(rgba(51, 65, 85, 0.3) 1px, transparent 1px);
+  background-size: 20px 20px;
+}

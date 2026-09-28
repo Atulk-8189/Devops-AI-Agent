@@ -1,0 +1,35 @@
+[project]
+user_env = []
+persist_user_env = false
+mask_user_env = true
+cache = false
+session_timeout = 300
+user_session_timeout = 900
+allow_origins = ["http://127.0.0.1:8000", "http://localhost:8000"]
+
+[features]
+unsafe_allow_html = false
+latex = false
+edit_message = false
+allow_thread_sharing = false
+favorites = false
+
+[features.spontaneous_file_upload]
+enabled = false
+
+[features.audio]
+enabled = false
+
+[features.mcp]
+enabled = false
+
+[UI]
+name = "DevOps AI Agent"
+description = "Local read-only DevOps investigations"
+default_theme = "dark"
+cot = "hidden"
+custom_js = "/public/custom.js"
+custom_css = "/public/custom.css"
+
+[meta]
+generated_by = "2.12.0"

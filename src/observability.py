@@ -274,5 +274,8 @@ async def _call(boundary, invoke, **metadata):
     failed = any(getattr(message, "status", None) == "error" for message in messages)
     emit("mcp_failure" if failed else ("mcp_result" if boundary == "mcp" else "model_call_completed"),
          outcome="failed" if failed else "completed", duration_ms=(monotonic()-started)*1000, **metadata)
+    if boundary == "mcp":
+        from src.tool_results import bound_kubectl_log_result
+        result = bound_kubectl_log_result(result, tool_name=metadata.get("tool_name"))
     accept_result(result, boundary)
     return result

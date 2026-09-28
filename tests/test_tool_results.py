@@ -39,8 +39,20 @@ class ToolResultTests(unittest.TestCase):
         value = {"text": "x"*8100}
         result = normalize_successful_tool_result(ToolMessage(content=json.dumps(value), name="repo_file", tool_call_id="one"))
         self.assertEqual(result["content"], {"original_content_type": "json",
-            "truncated_preview": json.dumps(value, sort_keys=True, separators=(",", ":"))[:8000]})
+            "truncated_preview": json.dumps(value, sort_keys=True, separators=(",", ":"))[:8000] + "... [TRUNCATED]"})
         self.assertEqual(result["truncation_notice"], "Result content was limited to 8000 characters.")
+
+    def test_call_kubectl_string_tail_truncation(self):
+        value = "x" * 10000
+        result = normalize_successful_tool_result(ToolMessage(content=value, name="call_kubectl", tool_call_id="one"))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["content"], "...[truncated 2000 chars]...\n" + "x" * 8000)
+
+    def test_normal_string_head_truncation(self):
+        value = "x" * 10000
+        result = normalize_successful_tool_result(ToolMessage(content=value, name="repo_file", tool_call_id="one"))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["content"], "x" * 8000 + "\n...[truncated 2000 chars]...")
         nested = 0
         for _ in range(70):
             nested = [nested]
@@ -58,8 +70,56 @@ class ToolResultTests(unittest.TestCase):
         bounded = normalize_successful_tool_result(
             ToolMessage(content=value, name="repo_file", tool_call_id="one"), max_chars=10000)
         self.assertTrue(bounded["truncated"])
-        self.assertEqual(len(bounded["content"]), 10000)
+        self.assertEqual(bounded["content"], "x" * 10000 + "\n...[truncated 10000 chars]...")
         self.assertIn("10000", bounded["truncation_notice"])
+
+    def test_bound_kubectl_log_result_oversized_preserves_tail_and_marker(self):
+        from src.tool_results import bound_kubectl_log_result
+        original_text = "HEAD_CONTENT_" + ("middle_" * 1000) + "_TAIL_ERROR_LINE"
+        msg = ToolMessage(content=original_text, name="call_kubectl", tool_call_id="call-k8s")
+        bound_kubectl_log_result(msg, max_chars=50)
+
+        # Ensure tail is preserved
+        self.assertTrue(msg.content.endswith("_TAIL_ERROR_LINE"))
+        self.assertNotIn("HEAD_CONTENT_", msg.content)
+        # Ensure truncation marker is prepended with counts
+        self.assertIn("[TRUNCATED: original", msg.content)
+        self.assertIn("retained 50 characters from log tail", msg.content)
+        # Ensure metadata is stored in additional_kwargs
+        truncation = msg.additional_kwargs.get("truncation")
+        self.assertIsNotNone(truncation)
+        self.assertEqual(truncation["original_chars"], len(original_text))
+        self.assertEqual(truncation["retained_chars"], 50)
+        self.assertTrue(truncation["truncated"])
+
+    def test_bound_kubectl_log_result_under_limit_untouched(self):
+        from src.tool_results import bound_kubectl_log_result
+        short_text = "all clear healthy pod"
+        msg = ToolMessage(content=short_text, name="call_kubectl", tool_call_id="call-k8s")
+        bound_kubectl_log_result(msg, max_chars=500)
+        self.assertEqual(msg.content, short_text)
+        self.assertEqual(getattr(msg, "additional_kwargs", {}), {})
+
+    def test_bound_kubectl_log_result_blocks_format(self):
+        from src.tool_results import bound_kubectl_log_result
+        blocks = [{"type": "text", "text": "START_" + ("x" * 500) + "_END"}]
+        msg = ToolMessage(content=blocks, name="call_kubectl", tool_call_id="call-k8s")
+        bound_kubectl_log_result(msg, max_chars=20)
+        bounded_text = msg.content[0]["text"]
+        self.assertTrue(bounded_text.endswith("_END"))
+        self.assertNotIn("START_", bounded_text)
+        self.assertIn("[TRUNCATED: original", bounded_text)
+
+    def test_bound_kubectl_log_result_logging_no_raw_output(self):
+        from src.tool_results import bound_kubectl_log_result
+        sensitive_log = "SUPER_SECRET_TOKEN_IN_LOG" + ("A" * 2000)
+        msg = ToolMessage(content=sensitive_log, name="call_kubectl", tool_call_id="call-k8s")
+        with self.assertLogs("src.tool_results", level="INFO") as captured:
+            bound_kubectl_log_result(msg, max_chars=100)
+        # Verify log contains counts but NOT raw text
+        self.assertTrue(any("original_chars=" in record and "retained_chars=100" in record for record in captured.output))
+        for record in captured.output:
+            self.assertNotIn("SUPER_SECRET_TOKEN", record)
 
     def test_budget_can_normalize_without_importing_workflow_or_entrypoint(self):
         # A fresh interpreter avoids cached modules concealing a reverse dependency.

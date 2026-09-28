@@ -17,6 +17,8 @@ from src.agent.aks_troubleshooting import (
     evaluate_service_endpoints,
     normalize_kubernetes_response,
     read_container_logs,
+    is_explicit_log_request,
+    _log_step_outcome,
 )
 from src.policy.policy import enforce_read_only_policy
 from src.agent.aks_network import network_evidence, service_details
@@ -1465,6 +1467,355 @@ class AKSContainerLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence.container_logs, [])
         report = json.loads(evidence.model_input())
         self.assertEqual(report["container_logs"], [])
+
+    async def test_read_container_logs_tail_preservation(self):
+        raw_output = "\n".join(f"log line {i}" for i in range(1, 151))
+        fake_tool = FakeCallKubectlTool({
+            "task-manager-6b5958cd6b-bqztx": raw_output
+        })
+        result = await read_container_logs([fake_tool], "task-manager-6b5958cd6b-bqztx", "task-manager", tail=50)
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["tail"], 50)
+        self.assertEqual(len(result["lines"]), 50)
+        self.assertEqual(result["lines"][0], "log line 101")
+        self.assertEqual(result["lines"][-1], "log line 150")
+
+    def test_is_explicit_log_request(self):
+        self.assertTrue(is_explicit_log_request("Inspect Task Manager application logs in the default namespace."))
+        self.assertTrue(is_explicit_log_request("Show logs for Task Manager"))
+        self.assertTrue(is_explicit_log_request("Can I see the pod log?"))
+        self.assertTrue(is_explicit_log_request("Check application logging"))
+        self.assertFalse(is_explicit_log_request("Is Task Manager healthy?"))
+        self.assertFalse(is_explicit_log_request("Check Task Manager deployment status"))
+        self.assertFalse(is_explicit_log_request("Are all pods running?"))
+        self.assertFalse(is_explicit_log_request(""))
+        self.assertFalse(is_explicit_log_request(None))
+
+    async def test_workflow_collects_logs_for_healthy_workloads_on_explicit_request(self):
+        healthy_pod = {
+            "metadata": {"name": "task-manager-healthy", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [healthy_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool({
+            "task-manager-healthy": "2026-09-28 10:00:00 INFO Service running normally\n",
+        })
+        evidence = await collect_task_manager_evidence(
+            [res_tool, log_tool],
+            log=lambda _: None,
+            question="Inspect Task Manager application logs in the default namespace.",
+        )
+        # Should collect current logs only (restarts is 0, so no --previous call)
+        self.assertEqual(len(log_tool.calls), 1)
+        self.assertIn("kubectl logs task-manager-healthy -n default -c task-manager --tail=100", log_tool.calls[0]["args"]["command"])
+        self.assertNotIn("--previous", log_tool.calls[0]["args"]["command"])
+        self.assertEqual(len(evidence.container_logs), 1)
+        self.assertEqual(evidence.container_logs[0]["status"], "available")
+        self.assertEqual(evidence.container_logs[0]["log_type"], "current")
+        self.assertEqual(evidence.container_logs[0]["lines"], ["2026-09-28 10:00:00 INFO Service running normally"])
+
+    async def test_workflow_skips_logs_for_healthy_workloads_on_health_check_question(self):
+        healthy_pod = {
+            "metadata": {"name": "task-manager-healthy", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [healthy_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool()
+        evidence = await collect_task_manager_evidence(
+            [res_tool, log_tool],
+            log=lambda _: None,
+            question="Are Task Manager pods healthy?",
+        )
+        self.assertEqual(len(log_tool.calls), 0)
+        self.assertEqual(evidence.container_logs, [])
+
+    async def test_workflow_collects_previous_logs_only_when_restarts_exist(self):
+        restarted_pod = {
+            "metadata": {"name": "task-manager-restarted", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 2,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                    "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [restarted_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool({
+            "--previous": "FATAL: Out of memory\n",
+            "task-manager-restarted": "2026-09-28 10:00:00 INFO Recovered and healthy\n",
+        })
+        # Even without explicit log request, restarts > 0 triggers both current and previous
+        evidence = await collect_task_manager_evidence(
+            [res_tool, log_tool],
+            log=lambda _: None,
+            question="Check Task Manager status",
+        )
+        self.assertEqual(len(log_tool.calls), 2)
+        self.assertEqual(len(evidence.container_logs), 2)
+        log_types = {l["log_type"] for l in evidence.container_logs}
+        self.assertEqual(log_types, {"current", "previous"})
+
+    def test_log_step_outcome_normalization(self):
+        # Successful logs normalize to "ok"
+        self.assertEqual(_log_step_outcome("available", previous=False), "ok")
+        self.assertEqual(_log_step_outcome("available", previous=True), "ok")
+        self.assertEqual(_log_step_outcome("empty", previous=False), "ok")
+        self.assertEqual(_log_step_outcome("empty", previous=True), "ok")
+        # Expected missing previous container is considered successful read
+        self.assertEqual(_log_step_outcome("not_found", previous=True), "ok")
+        # Unexpected missing current container remains non-ok
+        self.assertEqual(_log_step_outcome("not_found", previous=False), "not_found")
+        # Genuine errors remain non-ok
+        self.assertEqual(_log_step_outcome("error", previous=False), "error")
+        self.assertEqual(_log_step_outcome("error", previous=True), "error")
+        self.assertEqual(_log_step_outcome("unavailable", previous=False), "unavailable")
+
+    async def test_workflow_successful_current_logs_outcome_is_ok(self):
+        healthy_pod = {
+            "metadata": {"name": "task-manager-healthy", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [healthy_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool({
+            "task-manager-healthy": "2026-09-28 10:00:00 INFO Initialized and ready\n",
+        })
+        evidence = await collect_task_manager_evidence(
+            [res_tool, log_tool],
+            log=lambda _: None,
+            question="Inspect Task Manager application logs in the default namespace.",
+        )
+        log_step = next(s for s in evidence.steps if s.name.startswith("logs:"))
+        self.assertEqual(log_step.outcome, "ok")
+        self.assertEqual(log_step.payload["status"], "available")
+        # All evidence steps must be ok, meaning evidence is complete
+        self.assertFalse(any(s.outcome != "ok" for s in evidence.steps))
+
+    async def test_workflow_empty_logs_outcome_is_ok(self):
+        healthy_pod = {
+            "metadata": {"name": "task-manager-healthy", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [healthy_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool({
+            "task-manager-healthy": ToolMessage(content="   \n\n  ", status="success", tool_call_id="call-empty", name="call_kubectl")
+        })
+        evidence = await collect_task_manager_evidence(
+            [res_tool, log_tool],
+            log=lambda _: None,
+            question="Inspect Task Manager application logs in the default namespace.",
+        )
+        log_step = next(s for s in evidence.steps if s.name.startswith("logs:"))
+        self.assertEqual(log_step.outcome, "ok")
+        self.assertEqual(log_step.payload["status"], "empty")
+        self.assertFalse(any(s.outcome != "ok" for s in evidence.steps))
+
+    async def test_workflow_expected_missing_previous_logs_outcome_is_ok(self):
+        restarted_pod = {
+            "metadata": {"name": "task-manager-restarted", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 1,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                    "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [restarted_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        log_tool = FakeCallKubectlTool({
+            "--previous": ToolMessage(
+                content='Error from server (BadRequest): previous terminated container "task-manager" in pod "task-manager-restarted" not found\n',
+                status="error",
+                tool_call_id="call-prev",
+                name="call_kubectl",
+            ),
+            "task-manager-restarted": "2026-09-28 10:00:00 INFO Running normally\n",
+        })
+        evidence = await collect_task_manager_evidence(
+            [res_tool, log_tool],
+            log=lambda _: None,
+            question="Check Task Manager status",
+        )
+        prev_step = next(s for s in evidence.steps if s.name.endswith(":previous"))
+        self.assertEqual(prev_step.outcome, "ok")
+        self.assertEqual(prev_step.payload["status"], "not_found")
+        self.assertFalse(any(s.outcome != "ok" for s in evidence.steps))
+
+    async def test_workflow_genuine_log_failure_outcome_is_non_ok(self):
+        healthy_pod = {
+            "metadata": {"name": "task-manager-healthy", "namespace": "default"},
+            "spec": {"containers": [{"name": "task-manager"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "task-manager",
+                    "ready": True,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-09-25T10:00:00Z"}},
+                }],
+            },
+        }
+        res_tool = FakeKubectlTool({
+            "deployments": {
+                "metadata": {"name": "task-manager", "namespace": "default"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "task-manager"}}},
+                "status": {"availableReplicas": 1, "readyReplicas": 1},
+            },
+            "replicasets": {"items": []},
+            "pods": {"items": [healthy_pod]},
+            "services": {"metadata": {"name": "task-manager"}, "spec": {"selector": {"app": "task-manager"}}},
+            "endpoints": {"subsets": []},
+            "endpointslices": {"items": []},
+            "networkpolicies": {"items": []},
+            "events": {"items": []},
+        })
+        # Simulate genuine tool execution failure
+        log_tool = FakeCallKubectlTool({
+            "task-manager-healthy": ToolMessage(
+                content="Error from server (InternalError): unexpected transport EOF\n",
+                status="error",
+                tool_call_id="call-fail",
+                name="call_kubectl",
+            )
+        })
+        evidence = await collect_task_manager_evidence(
+            [res_tool, log_tool],
+            log=lambda _: None,
+            question="Inspect Task Manager application logs in the default namespace.",
+        )
+        log_step = next(s for s in evidence.steps if s.name.startswith("logs:"))
+        self.assertEqual(log_step.outcome, "error")
+        self.assertEqual(log_step.payload["status"], "error")
+        self.assertTrue(any(s.outcome != "ok" for s in evidence.steps))
 
 
 

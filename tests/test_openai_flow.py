@@ -317,9 +317,9 @@ class PipelineReadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(envelope["truncated"])
         self.assertIn("8000", envelope["truncation_notice"])
         preview = envelope["content"]["truncated_preview"]
-        self.assertEqual(len(preview), MAX_TOOL_RESULT_CHARS)
+        self.assertEqual(len(preview), MAX_TOOL_RESULT_CHARS + 15)
         serialized = json.dumps(blocks, sort_keys=True, separators=(",", ":"))
-        self.assertEqual(preview, serialized[:MAX_TOOL_RESULT_CHARS])
+        self.assertEqual(preview, serialized[:MAX_TOOL_RESULT_CHARS] + "... [TRUNCATED]")
         self.assertNotIn("END_OF_OVERSIZED_RESULT", text)
 
 
@@ -499,7 +499,7 @@ class OpenAIFlowTests(unittest.IsolatedAsyncioTestCase):
             content="x" * (MAX_TOOL_RESULT_CHARS + 100), tool_call_id="call-1", name="repo_file",
         ))
         self.assertTrue(envelope["truncated"])
-        self.assertEqual(len(envelope["content"]), MAX_TOOL_RESULT_CHARS)
+        self.assertEqual(len(envelope["content"]), MAX_TOOL_RESULT_CHARS + 28)
         self.assertIn(str(MAX_TOOL_RESULT_CHARS), envelope["truncation_notice"])
 
     def test_mcp_content_blocks_are_preserved_as_data(self):
@@ -1072,7 +1072,7 @@ class RepositoryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         envelope = json.loads(client.create.await_args_list[1].kwargs["messages"][-1]["content"][0]["text"])
         self.assertTrue(envelope["truncated"])
-        self.assertEqual(len(envelope["content"]["truncated_preview"]), 8000)
+        self.assertEqual(len(envelope["content"]["truncated_preview"]), 8015)
         self.assertEqual(files, [])
 
     def test_untrusted_prose_and_malformed_records_never_supply_ids(self):
@@ -1269,7 +1269,7 @@ class RepositoryFileReadTests(unittest.IsolatedAsyncioTestCase):
         ], [self.result("x" * 16000 + "OMITTED_TAIL")])
         envelope = self.envelope(client)
         self.assertTrue(envelope["truncated"])
-        self.assertEqual(len(envelope["content"]["truncated_preview"]), MAX_TOOL_RESULT_CHARS)
+        self.assertEqual(len(envelope["content"]["truncated_preview"]), MAX_TOOL_RESULT_CHARS + 15)
         self.assertIn("8000", envelope["truncation_notice"])
         self.assertNotIn("OMITTED_TAIL", json.dumps(envelope))
 
@@ -1499,7 +1499,7 @@ class AzureDevOpsInvestigationTests(unittest.IsolatedAsyncioTestCase):
         )
         envelope = self.tool_envelopes(client)[-1]
         self.assertTrue(envelope["truncated"])
-        self.assertEqual(len(envelope["content"]["truncated_preview"]), MAX_TOOL_RESULT_CHARS)
+        self.assertEqual(len(envelope["content"]["truncated_preview"]), MAX_TOOL_RESULT_CHARS + 15)
         self.assertIn("8000", envelope["truncation_notice"])
         self.assertNotIn("OMITTED_TAIL", json.dumps(envelope))
         self.assertEqual(execute.await_count, 3)

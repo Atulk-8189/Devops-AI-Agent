@@ -1,0 +1,4 @@
+# Install only into a separate Python 3.13 frontend environment.
+# The existing root .venv uses Python 3.14, unsupported by this Chainlit release.
+-r ../requirements.txt
+chainlit==2.12.0

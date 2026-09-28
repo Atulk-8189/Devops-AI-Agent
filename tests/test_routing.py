@@ -157,6 +157,30 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
     def test_other_question_routes_to_generic(self):
         self.assertEqual(route_question("List the available repositories"), "generic")
 
+    def test_log_investigation_routes_to_aks(self):
+        for question in (
+            "Inspect Task Manager application logs in the default namespace.",
+            "Show logs for Task Manager in the default namespace.",
+            "Check Task Manager container logs",
+            "Troubleshoot Task Manager pod failures",
+            "Why are Task Manager pods failing in the default namespace?",
+            "Investigate Task Manager pod crashing and restarts",
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(route_question(question), "aks")
+
+    def test_non_kubernetes_requests_retain_existing_routes(self):
+        cases = [
+            ("List the available repositories", "generic"),
+            ("Inspect the Task Manager repository for deployment files", "generic"),
+            ("Check Task Manager's pipeline status", "generic"),
+            ("Review the Terraform configuration in the terraform folder", "terraform"),
+            ("Investigate the latest pipeline failure", "azure_devops"),
+        ]
+        for question, expected in cases:
+            with self.subTest(question=question, expected=expected):
+                self.assertEqual(route_question(question), expected)
+
     def test_no_argument_cli_retains_documented_terraform_default(self):
         self.assertEqual(parse_cli_question([]), DEFAULT_QUESTION)
 

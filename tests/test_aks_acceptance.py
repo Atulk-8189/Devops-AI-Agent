@@ -169,3 +169,34 @@ class AKSAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("incomplete", answer["Summary"])
                 collection_status = "complete" if outcome == "missing" else "partial"
                 self.assertTrue(any(r.get("evidence_status") == collection_status for r in records))
+
+    async def test_successful_log_inspection_emits_complete_evidence_status(self):
+        service, endpoints, slices, pods = aks.ServiceNetworkTests().fixtures()
+        responses = {
+            "deployments": aks.deployment(),
+            "pods": pods,
+            "services": service,
+            "endpoints": endpoints,
+            "endpointslices": slices,
+        }
+        res_tool = aks.FakeKubectlTool(responses)
+        log_tool = aks.FakeCallKubectlTool({
+            "task-manager": "2026-09-28 10:00:00 INFO Service running normally\n",
+        })
+        runtime = flow.FakeRuntime([res_tool, log_tool])
+        client = flow.FakeOpenAIClient([flow.completion(json.dumps(self.diagnosis(
+            "Workload is healthy.", ["Deployment and pods are ready.", "Logs indicate normal operation."]
+        )))])
+        question = "Inspect Task Manager application logs in the default namespace."
+        session = TaskSession()
+        with flow.GenericAgentFlowTests.generic_patches(self, client, runtime), \
+                patch("builtins.print"), self.assertLogs("src.observability", level="INFO") as captured:
+            await session.request(question)
+        records = [json.loads(r.getMessage()) for r in captured.records]
+        # Verify evidence_result emitted complete
+        evidence_result = next(r for r in records if r["event"] == "evidence_result")
+        self.assertEqual(evidence_result["evidence_status"], "complete")
+        # Verify request_completed does NOT report incomplete
+        completed_record = next(r for r in records if r["event"] == "request_completed")
+        self.assertEqual(completed_record["outcome"], "completed")
+        self.assertNotIn("evidence_status", completed_record)

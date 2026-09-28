@@ -1,0 +1,9 @@
+.venv/
+.files/
+.chainlit/translations/
+chainlit.md
+__pycache__/
+*.pyc
+.env
+*.db
+*.db-*
